@@ -58,7 +58,7 @@ graphics held 24 FPS in a full Battleon in testing.
 - **No tracking, telemetry or update checks.** The only connections are to Artix's game servers and, once,
   to Cisco to download the free OpenH264 video decoder Ruffle uses for in-game videos.
 - **The log file contains no account details** (no email, username or chat).
-- **VirusTotal scan:** [0 detections](https://www.virustotal.com/gui/file/ae6994c7eca9d951f2a16d3e4f1b612fee2487fea51865a6eb267ba3e2c859d5) (version 1.0)
+- **VirusTotal (version 1.0):** [zip 0/68](https://www.virustotal.com/gui/file/ae6994c7eca9d951f2a16d3e4f1b612fee2487fea51865a6eb267ba3e2c859d5) · [Mugetsu.exe 0/71](https://www.virustotal.com/gui/file/d50fe21542e18d212d56ba736ce2f0d64d65849d85567cea744d0579e735ed2a)
 - **SHA-256** of each release zip is listed on its release page, so you can check your download.
 
 ## FAQ
