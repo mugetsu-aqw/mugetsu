@@ -36,9 +36,9 @@ On the same PC, Flash drops to **7–10 FPS** and standard Ruffle to **8–16 FP
 
 - Windows 10 or 11, 64-bit
 - A graphics card with **Vulkan** (NVIDIA GTX 600 / AMD Radeon HD 7000 / Intel 6th-gen Core or newer).
-  Without Vulkan, Mugetsu falls back to DirectX 12 (slower) and tells you so. Some Intel laptop
-  graphics (e.g. UHD 620) have a driver bug that crashes Vulkan: Mugetsu then says so and
-  switches to DirectX 12 by itself.
+  Without Vulkan, Mugetsu uses DirectX 12 instead (since 1.1 it runs about as well) and tells you
+  so. Some Intel laptop graphics (e.g. UHD 620) have a driver bug that crashes Vulkan: Mugetsu
+  then says so and switches to DirectX 12 by itself.
 - **Graphics memory:** 2 GB minimum (with AQW's Quality set to **Low**), 4 GB or more recommended
 - **RAM:** 8 GB minimum, 16 GB recommended
 - **CPU with AVX2:** Intel 4th-gen Core (2013) or newer, AMD Ryzen or newer
@@ -64,7 +64,7 @@ graphics held 24 FPS in a full Battleon in testing.
   message, nothing is downloaded). To switch the check off, put an empty file named `no-update-check`
   next to `Mugetsu.exe`.
 - **The log file contains no account details** (no email, username or chat).
-- **VirusTotal (version 1.0.1):** [zip 0/66](https://www.virustotal.com/gui/file/2352c7174fa62a73fba7afd707f3b1817b791542a40f7b5a1e7a6cb3c95aa804) · [Mugetsu.exe 0/71](https://www.virustotal.com/gui/file/489824a8f1003ead69ab40c2de2138381dca93bb6bc01f779230c80e4e93c0b1)
+- **VirusTotal (version 1.1.0):** [zip 0/67](https://www.virustotal.com/gui/file/01a1875ad4be59c2eb699c305c0fc6bd07dc873ffd0d9c39e00f171e5613114a) · [Mugetsu.exe 0/71](https://www.virustotal.com/gui/file/955847db34769b906f4a7e285db84456b37d3c194119601c907bd008f71b0738)
 - **SHA-256** of each release zip is listed on its release page, so you can check your download.
 
 ## FAQ
