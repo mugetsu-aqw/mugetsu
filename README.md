@@ -65,7 +65,7 @@ graphics held 24 FPS in a full Battleon in testing.
   message, nothing is downloaded). To switch the check off, put an empty file named `no-update-check`
   next to `Mugetsu.exe`.
 - **The log file contains no account details** (no email, username or chat).
-- **VirusTotal (version 1.1.1):** [zip 0/67](https://www.virustotal.com/gui/file/60c05f54fea03be37316a1b04c630daaf71af476dcef540fd818ea28158fb867) · [Mugetsu.exe 0/71](https://www.virustotal.com/gui/file/21832878c490e7db76a40addf5d8f63c3dbcd033a21b5e14f1de385d95bcd9e1)
+- **VirusTotal (version 1.1.2):** [zip 0/66](https://www.virustotal.com/gui/file/9e5250d559322f95906767d1458dcd843c9997208e42459a79aea494214c9844) · [Mugetsu.exe 0/71](https://www.virustotal.com/gui/file/17ed623568d711f30dbc6564f4299f81ca2a475f61498996af070151b444d67f)
 - **SHA-256** of each release zip is listed on its release page, so you can check your download.
 
 ## FAQ
