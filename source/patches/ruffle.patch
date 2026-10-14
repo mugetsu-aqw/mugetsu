@@ -3256,36 +3256,6 @@ index 0c50b8c58..495f9671a 100644
          fn new_empty_font<'gc>(
              context: &mut dyn LayoutContext<'gc>,
              span: &TextSpan,
-diff --git a/core/src/input.rs b/core/src/input.rs
-index 922d13ea..6234ab31 100644
---- a/core/src/input.rs
-+++ b/core/src/input.rs
-@@ -227,7 +227,10 @@ impl InputManager {
-             PlayerEvent::Ime(ime) => InputEvent::Ime(ime),
- 
-             // The following are not input events.
--            PlayerEvent::FocusGained | PlayerEvent::FocusLost => return None,
-+            PlayerEvent::FocusGained | PlayerEvent::FocusLost => {
-+                self.clear_keys();
-+                return None;
-+            }
-         };
- 
-         self.handle_event(&event);
-@@ -300,6 +303,13 @@ impl InputManager {
-         index
-     }
- 
-+    pub fn clear_keys(&mut self) {
-+        self.keys_down.clear();
-+        self.keys_down_phys_loc.clear();
-+        self.last_key = KeyCode::UNKNOWN;
-+        self.last_char = None;
-+    }
-+
-     pub fn is_key_down(&self, key: KeyCode) -> bool {
-         self.keys_down.contains(&key)
-     }
 diff --git a/core/src/lib.rs b/core/src/lib.rs
 index d76c1cba7..070234679 100644
 --- a/core/src/lib.rs
