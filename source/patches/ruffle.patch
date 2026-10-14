@@ -14284,3 +14284,60 @@ index 9ebd5e94a..54eb29d88 100644
              &instance,
              None,
              Default::default(),
+
+diff --git a/core/src/events.rs b/core/src/events.rs
+index a1f52a70..1ec66635 100644
+--- a/core/src/events.rs
++++ b/core/src/events.rs
+@@ -328,6 +328,8 @@ impl ClipEvent<'_> {
+         ClipEventFlag::DRAG_OUT.bits()
+             | ClipEventFlag::DRAG_OVER.bits()
+             | ClipEventFlag::KEY_PRESS.bits()
++            | ClipEventFlag::KEY_DOWN.bits()
++            | ClipEventFlag::KEY_UP.bits()
+             | ClipEventFlag::PRESS.bits()
+             | ClipEventFlag::ROLL_OUT.bits()
+             | ClipEventFlag::ROLL_OVER.bits()
+             | ClipEventFlag::RELEASE.bits()
+             | ClipEventFlag::RELEASE_OUTSIDE.bits(),
+     );
+ 
+diff --git a/core/src/input.rs b/core/src/input.rs
+index 922d13ea..659a11a5 100644
+--- a/core/src/input.rs
++++ b/core/src/input.rs
+@@ -104,7 +104,7 @@ impl InputManager {
+             last_char: None,
+             last_click: None,
+             gamepad_button_mapping,
+-            key_code_mapping_type: KeyCodeMappingType::Logical,
++            key_code_mapping_type: KeyCodeMappingType::Physical,
+         }
+     }
+ 
+@@ -227,7 +227,10 @@ impl InputManager {
+             PlayerEvent::Ime(ime) => InputEvent::Ime(ime),
+ 
+             // The following are not input events.
+-            PlayerEvent::FocusGained | PlayerEvent::FocusLost => return None,
++            PlayerEvent::FocusGained | PlayerEvent::FocusLost => {
++                self.clear_keys();
++                return None;
++            }
+         };
+ 
+         self.handle_event(&event);
+@@ -300,6 +303,13 @@ impl InputManager {
+         index
+     }
+ 
++    pub fn clear_keys(&mut self) {
++        self.keys_down.clear();
++        self.keys_down_phys_loc.clear();
++        self.last_key = KeyCode::UNKNOWN;
++        self.last_char = None;
++    }
++
+     pub fn is_key_down(&self, key: KeyCode) -> bool {
+         self.keys_down.contains(&key)
+     }
