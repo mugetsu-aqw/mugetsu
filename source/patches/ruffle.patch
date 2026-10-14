@@ -571,7 +571,7 @@ index f6a511ef6..c51fb68e3 100644
          method: Method<'gc>,
          scope: ScopeChain<'gc>,
 diff --git a/core/src/avm2/globals/flash/display/display_object.rs b/core/src/avm2/globals/flash/display/display_object.rs
-index b87ee606c..4d4c28f51 100644
+index b87ee606..6b2eb9c4 100644
 --- a/core/src/avm2/globals/flash/display/display_object.rs
 +++ b/core/src/avm2/globals/flash/display/display_object.rs
 @@ -80,6 +80,7 @@ pub fn set_alpha<'gc>(
@@ -658,7 +658,24 @@ index b87ee606c..4d4c28f51 100644
  
          dobj.set_visible(activation.context, new_visible);
      }
-@@ -1054,6 +1065,16 @@ pub fn get_bounds<'gc>(
+@@ -1032,8 +1043,14 @@ fn get_dobj_bounds<'gc>(
+         let to_target_matrix = target.global_to_local_matrix().unwrap_or_default();
+         to_target_matrix * to_global_matrix * bounds
+     };
+-    if !out_bounds.is_valid() {
+-        out_bounds = Rectangle::ZERO;
++    if !out_bounds.is_valid() || (out_bounds.width() == Twips::ZERO && out_bounds.height() == Twips::ZERO) {
++        // AQW build: if target coordinate transform yields zero or invalid rect (e.g. uninvertible or 0-scale matrix),
++        // fall back to untransformed child bounds to ensure visual rects don't collapse.
++        if bounds.is_valid() && (bounds.width() > Twips::ZERO || bounds.height() > Twips::ZERO) {
++            out_bounds = bounds;
++        } else if !out_bounds.is_valid() {
++            out_bounds = Rectangle::ZERO;
++        }
+     }
+ 
+     out_bounds
+@@ -1054,6 +1071,16 @@ pub fn get_bounds<'gc>(
  
          let out_bounds = get_dobj_bounds(dobj, target, BoundsMode::Script);
  
@@ -675,7 +692,7 @@ index b87ee606c..4d4c28f51 100644
          return new_rectangle(activation, out_bounds);
      }
      Ok(Value::Undefined)
-@@ -1074,6 +1095,16 @@ pub fn get_rect<'gc>(
+@@ -1074,6 +1101,16 @@ pub fn get_rect<'gc>(
  
          let out_bounds = get_dobj_bounds(dobj, target, BoundsMode::ScriptWithoutStrokes);
  
@@ -692,7 +709,7 @@ index b87ee606c..4d4c28f51 100644
          return new_rectangle(activation, out_bounds);
      }
      Ok(Value::Undefined)
-@@ -1106,6 +1137,7 @@ pub fn set_mask<'gc>(
+@@ -1106,6 +1143,7 @@ pub fn set_mask<'gc>(
  
      if let Some(this) = this.as_display_object() {
          let mask = args.try_get_object(0).and_then(|o| o.as_display_object());
@@ -700,7 +717,7 @@ index b87ee606c..4d4c28f51 100644
          this.set_mask(mask, activation.gc());
      }
      Ok(Value::Undefined)
-@@ -1133,6 +1165,7 @@ pub fn set_cache_as_bitmap<'gc>(
+@@ -1133,6 +1171,7 @@ pub fn set_cache_as_bitmap<'gc>(
  
      if let Some(this) = this.as_display_object() {
          let cache = args.get_bool(0);
@@ -708,7 +725,7 @@ index b87ee606c..4d4c28f51 100644
          this.set_bitmap_cached_preference(cache);
      }
      Ok(Value::Undefined)
-@@ -1203,3 +1236,48 @@ pub fn set_blend_shader<'gc>(
+@@ -1203,3 +1242,48 @@ pub fn set_blend_shader<'gc>(
      }
      Ok(Value::Undefined)
  }
@@ -848,7 +865,7 @@ index 644bc3509..9b90b9b41 100644
 +    Ok(Value::Undefined)
 +}
 diff --git a/core/src/avm2/object.rs b/core/src/avm2/object.rs
-index c35c655b1..68b561fcc 100644
+index c35c655b..9ae800c7 100644
 --- a/core/src/avm2/object.rs
 +++ b/core/src/avm2/object.rs
 @@ -27,6 +27,7 @@ use std::cell::{Ref, RefMut};
@@ -870,6 +887,24 @@ index c35c655b1..68b561fcc 100644
  pub use crate::avm2::object::index_buffer_3d_object::{
      IndexBuffer3DObject, IndexBuffer3DObjectWeak,
  };
+@@ -766,7 +769,16 @@ macro_rules! impl_downcast_methods {
+ 
+ impl<'gc> Object<'gc> {
+     pub fn ptr_eq<T: TObject<'gc>>(a: T, b: T) -> bool {
+-        std::ptr::eq(a.as_ptr(), b.as_ptr())
++        if std::ptr::eq(a.as_ptr(), b.as_ptr()) {
++            return true;
++        }
++        // AQW build: if both objects wrap a DisplayObject, check if they reference the same underlying node.
++        let a_obj: Object<'gc> = a.into();
++        let b_obj: Object<'gc> = b.into();
++        if let (Some(dobj_a), Some(dobj_b)) = (a_obj.as_display_object(), b_obj.as_display_object()) {
++            return DisplayObject::ptr_eq(dobj_a, dobj_b);
++        }
++        false
+     }
+ 
+     impl_downcast_methods! {
 diff --git a/core/src/avm2/object/aqw_inspect.rs b/core/src/avm2/object/aqw_inspect.rs
 new file mode 100644
 index 000000000..103a34f24
@@ -1114,7 +1149,7 @@ index 7414b69d5..f1c70387d 100644
          Ok(object)
      }
 diff --git a/core/src/avm2/object/script_object.rs b/core/src/avm2/object/script_object.rs
-index 7fbbf13f0..70a4b91cf 100644
+index 7fbbf13f..069d2811 100644
 --- a/core/src/avm2/object/script_object.rs
 +++ b/core/src/avm2/object/script_object.rs
 @@ -79,6 +79,77 @@ pub struct ScriptObjectData<'gc> {
@@ -1195,6 +1230,34 @@ index 7fbbf13f0..70a4b91cf 100644
  impl<'gc> TObject<'gc> for ScriptObject<'gc> {
      fn gc_base(&self) -> Gc<'gc, ScriptObjectData<'gc>> {
          self.0
+@@ -220,12 +291,21 @@ impl<'gc> ScriptObjectWrapper<'gc> {
+             // as dynamic properties that have not yet been set, and yield
+             // `undefined`
+             if self.is_sealed() {
+-                Err(error::make_reference_error(
+-                    activation,
+-                    error::ReferenceErrorCode::InvalidRead,
+-                    multiname,
+-                    self.instance_class(),
+-                ))
++                // AQW build: sealed DisplayObject classes (e.g. MonsterMC, custom avatar MovieClips)
++                // return undefined instead of throwing fatal Error #1069 when optional properties like mcChar are checked.
++                let is_display_object = self.instance_class().has_class_in_chain(
++                    activation.avm2().classes().display_object.inner_class_definition(),
++                );
++                if is_display_object {
++                    Ok(Value::Undefined)
++                } else {
++                    Err(error::make_reference_error(
++                        activation,
++                        error::ReferenceErrorCode::InvalidRead,
++                        multiname,
++                        self.instance_class(),
++                    ))
++                }
+             } else {
+                 Ok(Value::Undefined)
+             }
 diff --git a/core/src/avm2/script.rs b/core/src/avm2/script.rs
 index 460db42ae..5151c7423 100644
 --- a/core/src/avm2/script.rs
@@ -2701,7 +2764,7 @@ index 8b139136b..699ad5009 100644
 +    }
  }
 diff --git a/core/src/display_object/interactive.rs b/core/src/display_object/interactive.rs
-index 1cd38a85d..29fce9227 100644
+index 1cd38a85..7055c3d3 100644
 --- a/core/src/display_object/interactive.rs
 +++ b/core/src/display_object/interactive.rs
 @@ -456,6 +456,72 @@ pub trait TInteractiveObject<'gc>:
@@ -2777,6 +2840,34 @@ index 1cd38a85d..29fce9227 100644
                  handled.into()
              }
              ClipEvent::RollOver { from } | ClipEvent::DragOver { from } => {
+@@ -753,22 +819,13 @@ pub trait TInteractiveObject<'gc>:
+     #[no_dynamic]
+     fn should_fire_event_handlers(
+         self,
+-        context: &mut UpdateContext<'gc>,
+-        event: ClipEvent,
++        _context: &mut UpdateContext<'gc>,
++        _event: ClipEvent,
+     ) -> bool {
+         // Event handlers are supported only by SWF6+.
+-        if self.as_displayobject().movie().version() < 6 {
+-            return false;
+-        }
+-
+-        // Non-keyboard events are always handled.
+-        if !event.is_key_event() {
+-            return true;
+-        }
+-
+-        // Keyboard events don't fire their methods unless the object has focus (#2120).
+-        // The focus highlight also has to be active (see test focus_keyboard_press).
+-        self.has_focus() && context.focus_tracker.highlight().is_active()
++        // AQW build: Always allow event handlers (including keyboard and WASD movement)
++        // to fire without requiring exclusive focus or active highlight outlines.
++        self.as_displayobject().movie().version() >= 6
+     }
+ }
+ 
 diff --git a/core/src/display_object/morph_shape.rs b/core/src/display_object/morph_shape.rs
 index 7d81315aa..0bc51ad94 100644
 --- a/core/src/display_object/morph_shape.rs
@@ -3165,6 +3256,36 @@ index 0c50b8c58..495f9671a 100644
          fn new_empty_font<'gc>(
              context: &mut dyn LayoutContext<'gc>,
              span: &TextSpan,
+diff --git a/core/src/input.rs b/core/src/input.rs
+index 922d13ea..6234ab31 100644
+--- a/core/src/input.rs
++++ b/core/src/input.rs
+@@ -227,7 +227,10 @@ impl InputManager {
+             PlayerEvent::Ime(ime) => InputEvent::Ime(ime),
+ 
+             // The following are not input events.
+-            PlayerEvent::FocusGained | PlayerEvent::FocusLost => return None,
++            PlayerEvent::FocusGained | PlayerEvent::FocusLost => {
++                self.clear_keys();
++                return None;
++            }
+         };
+ 
+         self.handle_event(&event);
+@@ -300,6 +303,13 @@ impl InputManager {
+         index
+     }
+ 
++    pub fn clear_keys(&mut self) {
++        self.keys_down.clear();
++        self.keys_down_phys_loc.clear();
++        self.last_key = KeyCode::UNKNOWN;
++        self.last_char = None;
++    }
++
+     pub fn is_key_down(&self, key: KeyCode) -> bool {
+         self.keys_down.contains(&key)
+     }
 diff --git a/core/src/lib.rs b/core/src/lib.rs
 index d76c1cba7..070234679 100644
 --- a/core/src/lib.rs
@@ -3611,7 +3732,7 @@ index 74188cd5e..2bc342602 100644
      }
  
 diff --git a/core/src/player.rs b/core/src/player.rs
-index 675ef3a78..6d77cdb1a 100644
+index 675ef3a7..61e2f71f 100644
 --- a/core/src/player.rs
 +++ b/core/src/player.rs
 @@ -144,6 +144,13 @@ pub struct MouseData<'gc> {
@@ -3804,7 +3925,55 @@ index 675ef3a78..6d77cdb1a 100644
      pub fn background_color(&mut self) -> Option<Color> {
          self.mutate_with_update_context(|context| context.stage.background_color())
      }
-@@ -1315,6 +1452,18 @@ impl Player {
+@@ -1061,13 +1198,18 @@ impl Player {
+     }
+ 
+     fn handle_focus_event(&mut self, event: PlayerEvent) -> bool {
+-        if let PlayerEvent::FocusLost = event {
+-            self.mutate_with_update_context(|context| {
+-                let focus_tracker = context.focus_tracker;
+-                focus_tracker.reset_focus(context);
+-            });
+-        }
+-
++        self.input.clear_keys();
++        self.mutate_with_update_context(|context| {
++            let event_name = match event {
++                PlayerEvent::FocusLost => "deactivate",
++                PlayerEvent::FocusGained => "activate",
++                _ => return,
++            };
++            if let Some(stage) = context.stage.object2() {
++                let evt = Avm2EventObject::bare_default_event(context, event_name);
++                Avm2::dispatch_event(context, evt, stage.into());
++            }
++        });
+         true
+     }
+ 
+@@ -1231,13 +1373,18 @@ impl Player {
+                     .focus_tracker
+                     .get()
+                     .map(|o| o.as_displayobject())
++                    .filter(|o| o.is_on_stage(activation.context))
+                     .unwrap_or_else(|| activation.context.stage.into());
+ 
+-                if target_object.movie().is_action_script_3() {
+-                    let target = target_object
++                let target_avm2 = if target_object.movie().is_action_script_3() {
++                    target_object
+                         .object2()
+-                        .expect("DisplayObject was not constructed!");
++                        .or_else(|| activation.context.stage.object2())
++                } else {
++                    activation.context.stage.object2()
++                };
+ 
++                if let Some(target) = target_avm2 {
+                     Avm2::dispatch_event(activation.context, keyboard_event, target.into());
+                 }
+             }
+@@ -1315,6 +1462,18 @@ impl Player {
                  player_event_handled = true;
              }
  
@@ -3823,7 +3992,7 @@ index 675ef3a78..6d77cdb1a 100644
              // Fire event listener on appropriate object
              if let Some((listener_type, event_name, args)) = listener
                  && let Some(root_clip) = context.stage.root_clip()
-@@ -1668,6 +1817,19 @@ impl Player {
+@@ -1668,6 +1827,19 @@ impl Player {
              if !skip_mouse_hover
                  && !InteractiveObject::option_ptr_eq(cur_over_object, new_over_object)
              {
@@ -3843,7 +4012,7 @@ index 675ef3a78..6d77cdb1a 100644
                  // If the mouse button is down, the object the user clicked on grabs the focus
                  // and fires "drag" events.
                  if context.input.is_mouse_down(MouseButton::Left) {
-@@ -1806,6 +1968,9 @@ impl Player {
+@@ -1806,6 +1978,9 @@ impl Player {
                          MouseButton::Middle => ClipEvent::MiddlePress,
                          _ => unreachable!(),
                      };
@@ -3853,7 +4022,7 @@ index 675ef3a78..6d77cdb1a 100644
                      // Pressed on a hovered object.
                      if let Some(over_object) = context.mouse_data.hovered {
                          events.push((over_object, event));
-@@ -2088,6 +2253,16 @@ impl Player {
+@@ -2088,6 +2263,16 @@ impl Player {
  
      #[instrument(level = "debug", skip_all)]
      pub fn render(&mut self) {
@@ -3870,7 +4039,7 @@ index 675ef3a78..6d77cdb1a 100644
          let invalidated = self.enter_arena(|_, gc_root, _| gc_root.stage.invalidated());
  
          if invalidated {
-@@ -2099,6 +2274,7 @@ impl Player {
+@@ -2099,6 +2284,7 @@ impl Player {
  
          let mut background_color = Color::WHITE;
  
@@ -3878,7 +4047,7 @@ index 675ef3a78..6d77cdb1a 100644
          let (cache_draws, commands) = self.enter_arena_mut(|gc_context, gc_root, this| {
              let stage = gc_root.stage;
  
-@@ -2116,6 +2292,11 @@ impl Player {
+@@ -2116,6 +2302,11 @@ impl Player {
                  stage,
              };
  
@@ -3890,7 +4059,7 @@ index 675ef3a78..6d77cdb1a 100644
              stage.render_viewport(&mut render_context);
  
              #[cfg(feature = "egui")]
-@@ -2125,6 +2306,13 @@ impl Player {
+@@ -2125,6 +2316,13 @@ impl Player {
                      .draw_debug_rects(&mut render_context, gc_root.dynamic_root);
              }
  
@@ -3904,7 +4073,7 @@ index 675ef3a78..6d77cdb1a 100644
              background_color =
                  if stage.window_mode() != WindowMode::Transparent || stage.is_fullscreen() {
                      stage.background_color().unwrap_or(Color::WHITE)
-@@ -2139,6 +2327,7 @@ impl Player {
+@@ -2139,6 +2337,7 @@ impl Player {
              (cache_draws, commands)
          });
  
@@ -3912,7 +4081,7 @@ index 675ef3a78..6d77cdb1a 100644
          self.renderer
              .submit_frame(background_color, commands, cache_draws);
  
-@@ -2440,11 +2629,58 @@ impl Player {
+@@ -2440,11 +2639,58 @@ impl Player {
          self.update_mouse_state(EnumSet::empty(), false, &mut false);
  
          // GC
@@ -3972,7 +4141,7 @@ index 675ef3a78..6d77cdb1a 100644
      pub fn flush_shared_objects(&mut self) {
          self.update(|context| {
              if let Some(mut avm1_activation) =
-@@ -3002,6 +3238,8 @@ impl PlayerBuilder {
+@@ -3002,6 +3248,8 @@ impl PlayerBuilder {
                  middle_pressed: None,
                  forced_cursor: None,
                  updating_drop_target: false,
@@ -3981,7 +4150,7 @@ index 675ef3a78..6d77cdb1a 100644
              },
              avm1_shared_objects: HashMap::new(),
              avm2_shared_objects: HashMap::new(),
-@@ -3085,6 +3323,8 @@ impl PlayerBuilder {
+@@ -3085,6 +3333,8 @@ impl PlayerBuilder {
                  frame_phase: Default::default(),
                  frame_accumulator: FloatDuration::ZERO,
                  recent_run_frame_timings: VecDeque::with_capacity(10),
@@ -3990,7 +4159,7 @@ index 675ef3a78..6d77cdb1a 100644
                  start_time: Instant::now(),
                  time_offset: 0,
                  time_til_next_timer: None,
-@@ -3252,6 +3492,7 @@ fn run_mouse_pick<'gc>(
+@@ -3252,6 +3502,7 @@ fn run_mouse_pick<'gc>(
      context: &mut UpdateContext<'gc>,
      require_button_mode: bool,
  ) -> Option<InteractiveObject<'gc>> {
@@ -3998,7 +4167,7 @@ index 675ef3a78..6d77cdb1a 100644
      context.stage.iter_render_list().rev().find_map(|level| {
          level.as_interactive().and_then(|l| {
              if l.as_displayobject().movie().is_action_script_3() {
-@@ -3320,3 +3561,148 @@ pub enum PlayerMode {
+@@ -3320,3 +3571,148 @@ pub enum PlayerMode {
      /// Represents the debug version of Flash Player, i.e. flashplayerdebugger.
      Debug,
  }
@@ -5964,7 +6133,7 @@ literal 0
 HcmV?d00001
 
 diff --git a/desktop/src/app.rs b/desktop/src/app.rs
-index a3410740e..f464a6884 100644
+index a3410740..dff002a7 100644
 --- a/desktop/src/app.rs
 +++ b/desktop/src/app.rs
 @@ -15,7 +15,7 @@ use ruffle_core::swf::HeaderExt;
@@ -6276,7 +6445,19 @@ index a3410740e..f464a6884 100644
              }
              WindowEvent::DroppedFile(file) => {
                  if let Some(content_descriptor) = ContentDescriptor::new_local(&file, None) {
-@@ -140,6 +389,9 @@ impl MainWindow {
+@@ -130,9 +379,11 @@ impl MainWindow {
+                 }
+             }
+             WindowEvent::Focused(true) => {
++                self.modifiers = Default::default();
+                 self.player.handle_event(PlayerEvent::FocusGained);
+             }
+             WindowEvent::Focused(false) => {
++                self.modifiers = Default::default();
+                 self.player.handle_event(PlayerEvent::FocusLost);
+             }
+             WindowEvent::MouseInput { button, state, .. } => {
+@@ -140,6 +391,9 @@ impl MainWindow {
                      return;
                  }
  
@@ -6286,7 +6467,7 @@ index a3410740e..f464a6884 100644
                  use ruffle_core::events::MouseButton as RuffleMouseButton;
                  use winit::event::MouseButton;
                  let (x, y) = self.gui.window_to_movie_position(self.mouse_pos);
-@@ -203,6 +455,7 @@ impl MainWindow {
+@@ -203,6 +457,7 @@ impl MainWindow {
                  }
              }
              WindowEvent::CursorLeft { .. } => {
@@ -6294,7 +6475,38 @@ index a3410740e..f464a6884 100644
                  if let Some(mut player) = self.player.get() {
                      player.set_mouse_in_stage(false);
                  }
-@@ -389,11 +642,44 @@ impl MainWindow {
+@@ -287,24 +542,24 @@ impl MainWindow {
+                 (Some(width), None) => {
+                     let scale = width / movie_width;
+                     let height = movie_height * scale;
+-                    PhysicalSize::new(
++                    LogicalSize::new(
+                         width.max(1.0),
+-                        height.max(1.0) + height_offset * self.gui.window().scale_factor(),
++                        height.max(1.0) + height_offset,
+                     )
+                     .into()
+                 }
+                 (None, Some(height)) => {
+                     let scale = height / movie_height;
+                     let width = movie_width * scale;
+-                    PhysicalSize::new(
++                    LogicalSize::new(
+                         width.max(1.0),
+-                        height.max(1.0) + height_offset * self.gui.window().scale_factor(),
++                        height.max(1.0) + height_offset,
+                     )
+                     .into()
+                 }
+-                (Some(width), Some(height)) => PhysicalSize::new(
++                (Some(width), Some(height)) => LogicalSize::new(
+                     width.max(1.0),
+-                    height.max(1.0) + height_offset * self.gui.window().scale_factor(),
++                    height.max(1.0) + height_offset,
+                 )
+                 .into(),
+             };
+@@ -389,11 +644,44 @@ impl MainWindow {
          // We should look at changing our tick to happen somewhere else if we see any behavioural problems.
          if matches!(self.loaded, LoadingState::Loaded) {
              let new_time = Instant::now();
@@ -6339,7 +6551,7 @@ index a3410740e..f464a6884 100644
                      new_time + player.time_til_next_frame()
                  });
                  self.check_redraw();
-@@ -401,9 +687,36 @@ impl MainWindow {
+@@ -401,9 +689,36 @@ impl MainWindow {
          }
      }
  
@@ -6377,7 +6589,7 @@ index a3410740e..f464a6884 100644
              self.gui.window().request_redraw();
          }
      }
-@@ -429,6 +742,9 @@ macro_rules! enter_runtime {
+@@ -429,6 +744,9 @@ macro_rules! enter_runtime {
  impl App {
      pub fn new(preferences: GlobalPreferences) -> Result<(Self, EventLoop<RuffleEvent>), Error> {
          let event_loop = EventLoop::with_user_event().build()?;
@@ -6387,7 +6599,7 @@ index a3410740e..f464a6884 100644
  
          let mut font_database = fontdb::Database::default();
          font_database.load_system_fonts();
-@@ -461,9 +777,10 @@ impl ApplicationHandler<RuffleEvent> for App {
+@@ -461,9 +779,10 @@ impl ApplicationHandler<RuffleEvent> for App {
  
          if cause == StartCause::Init {
              let movie_url = self.preferences.cli.movie_url.clone();
@@ -6400,16 +6612,32 @@ index a3410740e..f464a6884 100644
  
              let no_gui = self.preferences.cli.no_gui;
              let min_window_size = if no_gui {
-@@ -479,7 +796,7 @@ impl ApplicationHandler<RuffleEvent> for App {
+@@ -476,12 +795,22 @@ impl ApplicationHandler<RuffleEvent> for App {
+             let preferred_height = self.preferences.cli.height;
+             let start_fullscreen = self.preferences.cli.fullscreen;
+ 
++            let height_offset = if no_gui { 0.0 } else { MENU_HEIGHT as f64 };
++            let (initial_width, initial_height) = match (preferred_width, preferred_height) {
++                (Some(w), Some(h)) => (w, h + height_offset),
++                (Some(w), None) => (w, (w / 960.0) * 550.0 + height_offset),
++                (None, Some(h)) => ((h / 550.0) * 960.0, h + height_offset),
++                (None, None) => (960.0, 550.0 + height_offset),
++            };
++            let initial_size = LogicalSize::new(initial_width, initial_height);
++
              #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
              let mut window_attributes = WindowAttributes::default()
                  .with_visible(false)
 -                .with_title("Ruffle")
 +                .with_title(crate::window_title()) // AQW build
                  .with_window_icon(Some(icon))
-                 .with_min_inner_size(min_window_size);
+-                .with_min_inner_size(min_window_size);
++                .with_min_inner_size(min_window_size)
++                .with_inner_size(initial_size);
  
-@@ -560,10 +877,14 @@ impl ApplicationHandler<RuffleEvent> for App {
+             #[cfg(target_os = "linux")]
+             {
+@@ -560,10 +889,14 @@ impl ApplicationHandler<RuffleEvent> for App {
                  minimized: false,
                  occluded: false,
                  mouse_pos: PhysicalPosition::new(0.0, 0.0),
@@ -6424,7 +6652,7 @@ index a3410740e..f464a6884 100644
              });
          }
      }
-@@ -619,7 +940,7 @@ impl ApplicationHandler<RuffleEvent> for App {
+@@ -619,7 +952,7 @@ impl ApplicationHandler<RuffleEvent> for App {
              }
  
              (Some(main_window), RuffleEvent::CloseFile) => {
@@ -6433,7 +6661,7 @@ index a3410740e..f464a6884 100644
                  main_window.gui.close_movie(&mut main_window.player);
              }
  
-@@ -729,3 +1050,17 @@ enum LoadingState {
+@@ -729,3 +1062,17 @@ enum LoadingState {
      WaitingForResize,
      Loaded,
  }
@@ -6807,7 +7035,7 @@ index 2383b2dde..d200c0ae8 100644
 +    });
 +}
 diff --git a/desktop/src/main.rs b/desktop/src/main.rs
-index 2265dc24c..a21fe06a7 100644
+index 2265dc24..0ed97334 100644
 --- a/desktop/src/main.rs
 +++ b/desktop/src/main.rs
 @@ -13,6 +13,7 @@ mod custom_event;
@@ -7084,7 +7312,7 @@ index 2265dc24c..a21fe06a7 100644
 +        ("--tcp-connections", None, Some("allow")),
 +        ("--player-version", None, Some("9")),
 +        ("--width", None, Some("960")),
-+        ("--height", None, Some("580")),
++        ("--height", None, Some("550")),
 +        // Draw on the dedicated GPU when there is one.
 +        ("--power", Some("-p"), Some("high")),
 +        // No menu bar: the window is just the game.
