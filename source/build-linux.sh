@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Builds Mugetsu from Ruffle's source and the patches in this folder.
 #
-#   ./build.sh                  (with the speed profile)
-#   ./build.sh --no-pgo         (without it)
-#   ./build.sh --prepare-only   (patched source only, no build)
+#   ./build-linux.sh                  (with the speed profile)
+#   ./build-linux.sh --no-pgo         (without it)
+#   ./build-linux.sh --prepare-only   (patched source only, no build)
 #
 # Needs: Rust (the version in RUST_VERSION), Java 17+ (Ruffle compiles its Flash classes
 # with it) and git. The result is build/out/Mugetsu.

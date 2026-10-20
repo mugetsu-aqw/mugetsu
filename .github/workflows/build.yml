@@ -1,9 +1,9 @@
-# Builds Mugetsu from source/ on GitHub's Windows and Linux machines.
+# Builds Mugetsu from source/ on GitHub's Windows, Linux and macOS machines.
 #
 # - Every change to source/ on main: test builds, downloadable from the run's page.
 # - Actions > Build Mugetsu > Run workflow, with "Create a draft release" ticked: also makes a
-#   draft release with the Windows zip, the Linux archive and their SHA-256 (notes from
-#   source/notes/<version>.md), to check and publish by hand.
+#   draft release with the Windows zip, the Linux archive, the macOS zip and their SHA-256
+#   (notes from source/notes/<version>.md), to check and publish by hand.
 name: Build Mugetsu
 
 on:
@@ -46,7 +46,7 @@ jobs:
 
       - name: Build
         shell: pwsh
-        run: ./source/build.ps1
+        run: ./source/build-window.ps1
 
       - name: Package
         id: package
@@ -111,7 +111,7 @@ jobs:
           java-version: '21'
 
       - name: Build
-        run: bash source/build.sh
+        run: bash source/build-linux.sh
 
       - name: Package
         id: package
@@ -140,9 +140,64 @@ jobs:
           name: release-linux
           path: release
 
+  macos:
+    # Apple silicon runner, pinned on purpose: macos-latest is macOS 26 now and macos-14
+    # (the previous Apple silicon image) is retired on 2 November 2026. The app is built
+    # universal, so one zip runs on both Apple silicon and Intel Macs; its deployment
+    # target (macOS 11.0) comes from build-macos.sh, not from the runner.
+    runs-on: macos-15
+    timeout-minutes: 360
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+      sha: ${{ steps.package.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: |
+          version=$(tr -d '[:space:]' < source/RUST_VERSION)
+          rustup toolchain install "$version" --profile minimal --no-self-update
+          rustup default "$version"
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          rustc --version
+
+      - name: Install Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Build
+        run: bash source/build-macos.sh --universal
+
+      - name: Package
+        id: package
+        run: |
+          version=$(sed -n 's/^pub const VERSION: &str = "\([^"]*\)";.*/\1/p' source/build/ruffle/desktop/src/mugetsu.rs)
+          app=source/build/out/Mugetsu.app
+          zip="source/build/out/Mugetsu-$version-macos-universal.zip"
+          test -d "$app"
+          test -f "$zip"
+          # Both slices in the one binary, and the ad-hoc signature is intact.
+          lipo -archs "$app/Contents/MacOS/Mugetsu"
+          codesign --verify --deep --strict "$app"
+          mkdir -p release
+          cp "$zip" release/
+          hash=$(shasum -a 256 "release/Mugetsu-$version-macos-universal.zip" | cut -d' ' -f1 | tr a-f A-F)
+          echo "Mugetsu $version"
+          echo "zip SHA-256: $hash"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$hash" >> "$GITHUB_OUTPUT"
+          printf '## Mugetsu %s (macOS)\n\nzip SHA-256: `%s`\n' "$version" "$hash" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: release
+
   release:
     if: ${{ inputs.release }}
-    needs: [windows, linux]
+    needs: [windows, linux, macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -158,14 +213,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.windows.outputs.version }}
           LINUX_VERSION: ${{ needs.linux.outputs.version }}
+          MACOS_VERSION: ${{ needs.macos.outputs.version }}
           SHA: ${{ needs.windows.outputs.sha }}
           LINUX_SHA: ${{ needs.linux.outputs.sha }}
+          MACOS_SHA: ${{ needs.macos.outputs.sha }}
         run: |
-          if [ "$VERSION" != "$LINUX_VERSION" ]; then
-            echo "Windows ($VERSION) and Linux ($LINUX_VERSION) versions differ"; exit 1
+          if [ "$VERSION" != "$LINUX_VERSION" ] || [ "$VERSION" != "$MACOS_VERSION" ]; then
+            echo "Versions differ: Windows ($VERSION), Linux ($LINUX_VERSION), macOS ($MACOS_VERSION)"; exit 1
           fi
           notes="source/notes/$VERSION.md"
           if [ ! -f "$notes" ]; then echo "Missing release notes: $notes"; exit 1; fi
-          # LINUX_SHA_PLACEHOLDER first: it contains SHA_PLACEHOLDER.
-          sed -e "s/LINUX_SHA_PLACEHOLDER/$LINUX_SHA/g" -e "s/SHA_PLACEHOLDER/$SHA/g" "$notes" > notes.md
+          # LINUX_SHA_PLACEHOLDER and MACOS_SHA_PLACEHOLDER first: they contain SHA_PLACEHOLDER.
+          sed -e "s/LINUX_SHA_PLACEHOLDER/$LINUX_SHA/g" \
+              -e "s/MACOS_SHA_PLACEHOLDER/$MACOS_SHA/g" \
+              -e "s/SHA_PLACEHOLDER/$SHA/g" "$notes" > notes.md
           gh release create "v$VERSION" release/* --draft --title "Mugetsu $VERSION" --notes-file notes.md --target "$GITHUB_SHA"

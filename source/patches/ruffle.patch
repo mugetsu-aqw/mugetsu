@@ -5402,18 +5402,32 @@ diff --git a/core/src/input.rs b/core/src/input.rs
 index 922d13ea4..78aa2b9e0 100644
 --- a/core/src/input.rs
 +++ b/core/src/input.rs
-@@ -104,10 +104,21 @@ impl InputManager {
+@@ -9,8 +9,12 @@ use std::collections::{HashMap, HashSet};
+ pub enum KeyCodeMappingType {
+     // TODO Make this configurable, it's not
+     //   yet possible to use this mapping type.
+-    #[expect(dead_code)]
++    #[cfg_attr(
++        not(any(target_os = "linux", target_os = "macos")),
++        expect(dead_code)
++    )]
+     Physical,
++    #[cfg_attr(any(target_os = "linux", target_os = "macos"), expect(dead_code))]
+     Logical,
+ }
+ 
+@@ -104,10 +108,21 @@ impl InputManager {
              last_char: None,
              last_click: None,
              gamepad_button_mapping,
-+            #[cfg(target_os = "linux")]
++            #[cfg(any(target_os = "linux", target_os = "macos"))]
 +            key_code_mapping_type: KeyCodeMappingType::Physical,
-+            #[cfg(not(target_os = "linux"))]
++            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
              key_code_mapping_type: KeyCodeMappingType::Logical,
          }
      }
  
-+    #[cfg(target_os = "linux")]
++    #[cfg(any(target_os = "linux", target_os = "macos"))]
 +    pub fn clear_keys(&mut self) {
 +        self.keys_down.clear();
 +        self.keys_down_phys_loc.clear();
@@ -6110,7 +6124,7 @@ index 675ef3a78..c8db8b9ce 100644
      }
  
      fn handle_focus_event(&mut self, event: PlayerEvent) -> bool {
-+        #[cfg(target_os = "linux")]
++        #[cfg(any(target_os = "linux", target_os = "macos"))]
 +        {
 +            self.input.clear_keys();
 +            self.mutate_with_update_context(|context| {
@@ -6125,7 +6139,7 @@ index 675ef3a78..c8db8b9ce 100644
 +                }
 +            });
 +        }
-+        #[cfg(not(target_os = "linux"))]
++        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
          if let PlayerEvent::FocusLost = event {
              self.mutate_with_update_context(|context| {
                  let focus_tracker = context.focus_tracker;
@@ -9154,14 +9168,14 @@ index a3410740e..f26876886 100644
                  }
              }
              WindowEvent::Focused(true) => {
-+                #[cfg(target_os = "linux")]
++                #[cfg(any(target_os = "linux", target_os = "macos"))]
 +                {
 +                    self.modifiers = Default::default();
 +                }
                  self.player.handle_event(PlayerEvent::FocusGained);
              }
              WindowEvent::Focused(false) => {
-+                #[cfg(target_os = "linux")]
++                #[cfg(any(target_os = "linux", target_os = "macos"))]
 +                {
 +                    self.modifiers = Default::default();
 +                }
@@ -9831,7 +9845,7 @@ index 851e57101..6979814c2 100644
          let mut item_clicked = false;
          self.position = self.position.or(egui_ctx.pointer_latest_pos());
  
-@@ -92,6 +104,322 @@ impl ContextMenu {
+@@ -92,6 +104,324 @@ impl ContextMenu {
  
          !should_close
      }
@@ -9998,7 +10012,9 @@ index 851e57101..6979814c2 100644
 +        &["Auto", "Vulkan", "OpenGL"],
 +        &[None, Some(Graphics::Vulkan), Some(Graphics::Gl)],
 +    );
-+    #[cfg(not(target_os = "linux"))]
++    #[cfg(target_os = "macos")]
++    return (&["Auto", "Metal"], &[None, Some(Graphics::Metal)]);
++    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 +    return (
 +        &["Auto", "Vulkan", "DirectX 12"],
 +        &[None, Some(Graphics::Vulkan), Some(Graphics::Dx12)],
@@ -10544,7 +10560,7 @@ index 000000000..d9b2c51ff
 +    std::process::exit(0);
 +}
 diff --git a/desktop/src/main.rs b/desktop/src/main.rs
-index 2265dc24c..91a3223d3 100644
+index 2265dc24c..9e73bacd9 100644
 --- a/desktop/src/main.rs
 +++ b/desktop/src/main.rs
 @@ -13,11 +13,14 @@ mod custom_event;
@@ -10689,7 +10705,7 @@ index 2265dc24c..91a3223d3 100644
  fn panic_hook(info: &PanicHookInfo) {
      CALLSTACK.with(|callstack| {
          if let Some(callstack) = &*callstack.borrow() {
-@@ -85,60 +150,125 @@ fn panic_hook(info: &PanicHookInfo) {
+@@ -85,60 +150,138 @@ fn panic_hook(info: &PanicHookInfo) {
  
      let message = info.payload_as_str().unwrap_or("panic occurred");
  
@@ -10820,9 +10836,14 @@ index 2265dc24c..91a3223d3 100644
 +    } else if let Some(chosen) = mugetsu::saved_graphics() {
 +        #[cfg(target_os = "linux")]
 +        mugetsu::add_title_note(chosen.name());
-+        #[cfg(not(target_os = "linux"))]
++        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 +        mugetsu::add_title_note(format!("{} · right-click here to change", chosen.name()));
++        #[cfg(target_os = "macos")]
++        mugetsu::add_title_note(chosen.name());
 +        chosen.arg()
++    } else if cfg!(target_os = "macos") {
++        // Metal is the only graphics backend macOS offers (wgpu's Vulkan port needs MoltenVK).
++        "metal"
 +    } else if let Some(name) = mugetsu::intel_graphics(low_power) {
 +        INTEL_DX12.with(|intel| *intel.borrow_mut() = Some(name));
 +        "dx12"
@@ -10834,20 +10855,28 @@ index 2265dc24c..91a3223d3 100644
 +        "vulkan"
 +    };
 +    // (option, short form, value)
-+    let defaults: &[(&str, Option<&str>, Option<&str>)] = &[
++    let mut defaults: Vec<(&str, Option<&str>, Option<&str>)> = vec![
 +        ("--tcp-connections", None, Some("allow")),
 +        ("--player-version", None, Some("9")),
++    ];
++    // `--width`/`--height` are physical pixels. On a Retina display 960x580 would make the
++    // window half the apparent size of the 960x550 game, so let the loader SWF's stage size
++    // decide there instead.
++    #[cfg(not(target_os = "macos"))]
++    defaults.extend([
 +        ("--width", None, Some("960")),
 +        ("--height", None, Some("580")),
++    ]);
++    defaults.extend([
 +        // Draw on the dedicated GPU when there is one.
 +        ("--power", Some("-p"), Some("high")),
 +        // No menu bar: the window is just the game.
 +        ("--no-gui", None, None),
 +        ("--graphics", Some("-g"), Some(graphics)),
-+    ];
++    ]);
 +    let mut full = vec![args[0].clone(), AQW_LOADER_URL.into()];
 +    for (flag, short, value) in defaults {
-+        if (*flag == "--no-gui" && gui) || given(flag) || short.is_some_and(given) {
++        if (flag == "--no-gui" && gui) || given(flag) || short.is_some_and(given) {
 +            continue;
          }
 -        if let Ok(url) = Url::parse_with_params(
@@ -10865,7 +10894,7 @@ index 2265dc24c..91a3223d3 100644
  }
  
  fn main() -> Result<(), Error> {
-@@ -147,11 +277,19 @@ fn main() -> Result<(), Error> {
+@@ -147,11 +290,19 @@ fn main() -> Result<(), Error> {
          prev_hook(info);
          panic_hook(info);
      }));
@@ -10886,7 +10915,7 @@ index 2265dc24c..91a3223d3 100644
  
      #[cfg(feature = "shell-completions")]
      if let Some(shell) = opt.completions {
-@@ -163,6 +301,7 @@ fn main() -> Result<(), Error> {
+@@ -163,6 +314,7 @@ fn main() -> Result<(), Error> {
      let preferences = GlobalPreferences::load(opt)?;
  
      let logs_path = &preferences.cli.cache_directory.join("log");
@@ -10894,7 +10923,7 @@ index 2265dc24c..91a3223d3 100644
      let log_path = preferences.log_filename_pattern().create_path(logs_path);
      if let Some(parent) = log_path.parent() {
          std::fs::create_dir_all(parent)?;
-@@ -176,11 +315,19 @@ fn main() -> Result<(), Error> {
+@@ -176,11 +328,19 @@ fn main() -> Result<(), Error> {
      let (non_blocking_file, _file_guard) = tracing_appender::non_blocking(File::create(log_path)?);
      let (non_blocking_stdout, _stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
  
@@ -10919,7 +10948,7 @@ index 2265dc24c..91a3223d3 100644
  
      let subscriber = tracing_subscriber::registry()
          .with(env_filter)
-@@ -195,6 +342,23 @@ fn main() -> Result<(), Error> {
+@@ -195,6 +355,23 @@ fn main() -> Result<(), Error> {
  
      subscriber.init();
  
@@ -10948,7 +10977,7 @@ new file mode 100644
 index 000000000..53eb549ed
 --- /dev/null
 +++ b/desktop/src/mugetsu.rs
-@@ -0,0 +1,770 @@
+@@ -0,0 +1,812 @@
 +//! AQW build (Mugetsu): things the release player does on its own, without a launcher:
 +//! the window title, remembering that the Vulkan driver crashed on this PC (so the next start
 +//! uses DirectX 12), the "running on the built-in graphics" tip and the new-version notice.
@@ -10993,17 +11022,32 @@ index 000000000..53eb549ed
 +    dirs::config_local_dir().map(|dir| dir.join("ruffle"))
 +}
 +
-+/// A file named `name` next to Mugetsu.exe exists (`verbose-log`, `no-update-check`).
++/// A file named `name` next to Mugetsu's program exists (`verbose-log`, `no-update-check`).
 +pub fn exe_flag(name: &str) -> bool {
 +    // Also `name.txt`: Windows hides extensions, so a "new text document" renamed to `name`
 +    // is really `name.txt`.
-+    std::env::current_exe()
-+        .ok()
-+        .and_then(|exe| {
-+            exe.parent()
-+                .map(|dir| dir.join(name).exists() || dir.join(format!("{name}.txt")).exists())
-+        })
-+        .unwrap_or(false)
++    let found = |dir: &Path| dir.join(name).exists() || dir.join(format!("{name}.txt")).exists();
++    let Ok(exe) = std::env::current_exe() else {
++        return false;
++    };
++    let Some(dir) = exe.parent() else {
++        return false;
++    };
++    if found(dir) {
++        return true;
++    }
++    // In Mugetsu.app the program is Contents/MacOS/Mugetsu, where nobody would put a file:
++    // also look next to the app itself.
++    #[cfg(target_os = "macos")]
++    if let Some(outside) = dir
++        .parent()
++        .and_then(Path::parent)
++        .filter(|bundle| bundle.extension().and_then(|ext| ext.to_str()) == Some("app"))
++        .and_then(Path::parent)
++    {
++        return found(outside);
++    }
++    false
 +}
 +
 +// --- Vulkan driver crashes ----------------------------------------------------------------
@@ -11037,6 +11081,7 @@ index 000000000..53eb549ed
 +    }
 +}
 +
++#[cfg(windows)]
 +pub fn vulkan_starting() -> bool {
 +    VULKAN_STARTING.load(Ordering::SeqCst)
 +}
@@ -11048,6 +11093,8 @@ index 000000000..53eb549ed
 +}
 +
 +/// Remembers that the Vulkan driver crashed in `module` (full path of the crashed file).
++/// Only Windows has the crash handler that calls this (see `windows::install_crash_handler`).
++#[cfg(windows)]
 +pub fn save_vulkan_crash(module: &Path) {
 +    // A chosen "Vulkan" would bring the crash straight back on the restart.
 +    if saved_graphics() == Some(Graphics::Vulkan) {
@@ -11067,33 +11114,46 @@ index 000000000..53eb549ed
 +}
 +
 +/// The graphics API the player picked in the title-bar menu (`windows::add_graphics_menu`),
-+/// saved in this file as "vulkan" or "dx12"; no file means automatic.
++/// saved in this file as "vulkan" or "dx12"; no file means automatic. On macOS the file holds
++/// "metal" (the only backend the AQW build offers there).
 +const GRAPHICS_CHOICE_FILE: &str = "mugetsu-graphics.txt";
 +
 +#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 +pub enum Graphics {
++    #[cfg(not(target_os = "macos"))]
 +    Vulkan,
++    #[cfg(not(target_os = "macos"))]
 +    Dx12,
 +    #[cfg(target_os = "linux")]
 +    Gl,
++    #[cfg(target_os = "macos")]
++    Metal,
 +}
 +
 +impl Graphics {
 +    pub fn arg(self) -> &'static str {
 +        match self {
++            #[cfg(not(target_os = "macos"))]
 +            Graphics::Vulkan => "vulkan",
++            #[cfg(not(target_os = "macos"))]
 +            Graphics::Dx12 => "dx12",
 +            #[cfg(target_os = "linux")]
 +            Graphics::Gl => "gl",
++            #[cfg(target_os = "macos")]
++            Graphics::Metal => "metal",
 +        }
 +    }
 +
 +    pub fn name(self) -> &'static str {
 +        match self {
++            #[cfg(not(target_os = "macos"))]
 +            Graphics::Vulkan => "Vulkan",
++            #[cfg(not(target_os = "macos"))]
 +            Graphics::Dx12 => "DirectX 12",
 +            #[cfg(target_os = "linux")]
 +            Graphics::Gl => "OpenGL",
++            #[cfg(target_os = "macos")]
++            Graphics::Metal => "Metal",
 +        }
 +    }
 +}
@@ -11113,14 +11173,20 @@ index 000000000..53eb549ed
 +pub fn saved_graphics() -> Option<Graphics> {
 +    let text = std::fs::read_to_string(config_dir()?.join(GRAPHICS_CHOICE_FILE)).ok()?;
 +    match text.trim() {
++        #[cfg(not(target_os = "macos"))]
 +        "vulkan" => Some(Graphics::Vulkan),
++        #[cfg(not(target_os = "macos"))]
 +        "dx12" => Some(Graphics::Dx12),
 +        #[cfg(target_os = "linux")]
 +        "gl" => Some(Graphics::Gl),
++        #[cfg(target_os = "macos")]
++        "metal" => Some(Graphics::Metal),
 +        _ => None,
 +    }
 +}
 +
++/// Only Windows and Linux have a graphics choice in the title-bar menu; macOS always uses Metal.
++#[cfg(any(windows, target_os = "linux"))]
 +pub fn save_graphics(choice: Option<Graphics>) {
 +    let Some(dir) = config_dir() else {
 +        return;
@@ -11195,7 +11261,7 @@ index 000000000..53eb549ed
 +    pub interpolation: bool,
 +    pub flash_edges: bool,
 +    pub graphics: Option<Graphics>,
-+    /// Whether the graphics choice applies (Windows, playing AQW).
++    /// Whether the graphics choice applies (Windows and Linux, playing AQW).
 +    pub graphics_choice: bool,
 +    pub show_fps: bool,
 +}
@@ -11547,6 +11613,11 @@ index 000000000..53eb549ed
 +pub fn check_gpu_choice(window: Arc<Window>, chosen: &wgpu::AdapterInfo, power: wgpu::PowerPreference) {
 +    if chosen.device_type == wgpu::DeviceType::IntegratedGpu {
 +        let _ = BUILT_IN_GRAPHICS.set(chosen.name.clone());
++    }
++    // The tip below is about Windows' per-program graphics setting, which macOS doesn't have.
++    // (The Quality tip for built-in graphics still applies on macOS; it uses the chip above.)
++    if cfg!(target_os = "macos") {
++        return;
 +    }
 +    // `RUFFLE_TEST_GPU_TIP=1` shows the tip whenever the PC has a dedicated card (testing).
 +    let test = std::env::var_os("RUFFLE_TEST_GPU_TIP").is_some();
@@ -12176,6 +12247,66 @@ index 4c41c04bb..72101b699 100644
  
  [dev-dependencies]
  tempfile = { workspace = true }
+diff --git a/frontend-utils/src/backends/navigator.rs b/frontend-utils/src/backends/navigator.rs
+index 798dfe58..f97721b0 100644
+--- a/frontend-utils/src/backends/navigator.rs
++++ b/frontend-utils/src/backends/navigator.rs
+@@ -228,19 +228,45 @@ impl<F: FutureSpawner<Error> + 'static, I: NavigatorInterface> NavigatorBackend
+                     error: Error::FetchError("Network unavailable".to_string()),
+                 })?;
+ 
+-                let mut request_builder = match request.method() {
+-                    NavigationMethod::Get => client.get(processed_url.clone()),
+-                    NavigationMethod::Post => client.post(processed_url.clone()),
++                let build_request = || {
++                    let mut request_builder = match request.method() {
++                        NavigationMethod::Get => client.get(processed_url.clone()),
++                        NavigationMethod::Post => client.post(processed_url.clone()),
++                    };
++                    let (body_data, mime) = request.body().clone().unwrap_or_default();
++                    for (name, val) in request.headers().iter() {
++                        request_builder = request_builder.header(name, val);
++                    }
++                    request_builder.header("Content-Type", &mime).body(body_data)
+                 };
+-                let (body_data, mime) = request.body().clone().unwrap_or_default();
+-                for (name, val) in request.headers().iter() {
+-                    request_builder = request_builder.header(name, val);
+-                }
+-                request_builder = request_builder.header("Content-Type", &mime);
+ 
+-                request_builder = request_builder.body(body_data);
++                // AQW build (macOS): a DNS or connection hiccup while the game starts used to
++                // leave the window blank until Mugetsu was restarted. Retry a GET once; POSTs
++                // are not retried, as repeating them could repeat an action (e.g. a login).
++                #[cfg(target_os = "macos")]
++                let response = {
++                    let mut attempt = 0;
++                    loop {
++                        match spawn_tokio(build_request().send()).await {
++                            Err(e)
++                                if attempt == 0
++                                    && request.method() == NavigationMethod::Get
++                                    && e.is_connect() =>
++                            {
++                                attempt = 1;
++                                tracing::warn!(
++                                    "Could not connect to {processed_url}: {e}; retrying once"
++                                );
++                                Timer::after(Duration::from_millis(750)).await;
++                            }
++                            response => break response,
++                        }
++                    }
++                };
++                #[cfg(not(target_os = "macos"))]
++                let response = spawn_tokio(build_request().send()).await;
+ 
+-                let response = spawn_tokio(request_builder.send()).await.map_err(|e| {
++                let response = response.map_err(|e| {
+                     let inner = if e.is_connect() {
+                         Error::InvalidDomain(processed_url.to_string())
+                     } else {
 diff --git a/render/Cargo.toml b/render/Cargo.toml
 index 188549aee..69589f8cf 100644
 --- a/render/Cargo.toml
