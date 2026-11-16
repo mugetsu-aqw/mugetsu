@@ -41,12 +41,14 @@ How to use
   3. Log in as usual.
   Closing the game window closes everything.
 
-  Settings: right-click anywhere on the game for Mugetsu's menu: Frame interpolation
-  (smoother motion on strong Macs, off by default), Edge smoothing, Show FPS, Full screen
-  and Open log folder.
+  Settings: right-click anywhere on the game for Mugetsu's menu: Edge smoothing,
+  Performance mode (fewer pixels: faster on weak graphics), Frame interpolation (smoother
+  motion on strong Macs, off by default; with it on, also Frame pacing and an FPS limit),
+  Memory limit, Free memory now, Show FPS and Update reminders. Point at a setting to see
+  what it does. F11 switches full screen.
 
   Mugetsu keeps its settings in ~/Library/Application Support/ruffle and its log in
-  ~/Library/Caches/ruffle/log (the game's right-click menu opens the log folder).
+  ~/Library/Caches/ruffle/log.
 
 Command line
 ------------

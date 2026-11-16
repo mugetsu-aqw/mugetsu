@@ -116,7 +116,7 @@ index 75a150c..a351076 100644
          let transit = encoder
              .open_pass(hal_label(
 diff --git a/src/device/life.rs b/src/device/life.rs
-index 322c855..4af9606 100644
+index 322c855..729fcb1 100644
 --- a/src/device/life.rs
 +++ b/src/device/life.rs
 @@ -335,17 +335,18 @@ impl LifetimeTracker {
@@ -144,7 +144,7 @@ index 322c855..4af9606 100644
          work_done_closures
      }
  
-@@ -433,3 +434,73 @@ impl LifetimeTracker {
+@@ -433,3 +434,74 @@ impl LifetimeTracker {
          pending_callbacks
      }
  }
@@ -196,13 +196,14 @@ index 322c855..4af9606 100644
 +}
 +
 +/// AQW build: waits until the background thread has dropped every command buffer handed to
-+/// it so far (at most 2 s). Needed before reconfiguring a surface.
++/// it (at most 2 s), including those handed over meanwhile: dropping the last ones of a queue
++/// can hand over more. Needed before reconfiguring a surface, and while closing.
 +#[cfg(feature = "std")]
 +pub(crate) fn flush_encoder_drops() {
 +    use core::sync::atomic::Ordering;
-+    let queued = crate::aqw_stats::ENCODERS_QUEUED.load(Ordering::Acquire);
 +    let start = std::time::Instant::now();
-+    while crate::aqw_stats::ENCODERS_DROPPED.load(Ordering::Acquire) < queued
++    while crate::aqw_stats::ENCODERS_DROPPED.load(Ordering::Acquire)
++        < crate::aqw_stats::ENCODERS_QUEUED.load(Ordering::Acquire)
 +        && start.elapsed() < std::time::Duration::from_secs(2)
 +    {
 +        std::thread::sleep(std::time::Duration::from_micros(200));
@@ -341,10 +342,10 @@ index 2e09f25..39a7625 100644
                  if let Some(present) = surface.presentation.lock().take() {
                      if present.acquired_texture.is_some() {
 diff --git a/src/lib.rs b/src/lib.rs
-index 212aeff..bebfd59 100644
+index 212aeff..54aed95 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -251,3 +251,44 @@ mod tests {
+@@ -251,3 +251,60 @@ mod tests {
          assert_eq!(get_greatest_common_divisor(7, 7), 7);
      }
  }
@@ -377,6 +378,22 @@ index 212aeff..bebfd59 100644
 +    (
 +        ENCODERS_QUEUED.load(Relaxed).saturating_sub(ENCODERS_DROPPED.load(Relaxed)),
 +        ACTIVE_SUBMISSIONS.load(Relaxed),
++    )
++}
++
++/// AQW build: raw command buffers the Vulkan command pools hold (see
++/// `wgpu_hal::AQW_COMMAND_BUFFERS`), for Ruffle's perf log.
++pub fn aqw_command_buffers() -> usize {
++    hal::AQW_COMMAND_BUFFERS.load(core::sync::atomic::Ordering::Relaxed)
++}
++
++/// AQW build: (Vulkan command pools replaced by `RUFFLE_LEAN_POOLS`, pools that were reset
++/// before the GPU had finished with them and so were kept), for Ruffle's perf log.
++pub fn aqw_pool_stats() -> (usize, usize) {
++    use core::sync::atomic::Ordering::Relaxed;
++    (
++        hal::AQW_POOLS_REPLACED.load(Relaxed),
++        hal::AQW_EARLY_RESETS.load(Relaxed),
 +    )
 +}
 +

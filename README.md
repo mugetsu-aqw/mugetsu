@@ -50,15 +50,14 @@ where version 1.2 managed about 20, and draws each frame about **3.5× faster**.
   SteamOS 3 or newer; Linux uses Vulkan or OpenGL, details in the README inside the Linux download),
   or macOS 11 (Big Sur) or newer on Apple silicon or Intel (uses Metal; details in the README inside
   the macOS download)
-- A graphics card with **Vulkan** (NVIDIA GTX 600 / AMD Radeon HD 7000 / Intel 6th-gen Core or newer).
-  On Intel and Qualcomm (Snapdragon) graphics, Mugetsu uses DirectX 12 (their Vulkan drivers crash
-  or show a black window on several chips); since 1.1 it runs about as well as Vulkan. Without Vulkan,
-  Mugetsu also uses DirectX 12 and tells you so, and if a graphics driver crashes when Vulkan starts,
-  it switches to DirectX 12 by itself. To choose yourself, **right-click Mugetsu's title bar** → Graphics: Automatic, Vulkan
-  or DirectX 12 (try DirectX 12 if the window stays black or stutters).
+- A graphics card with **DirectX 12** or **Vulkan** (NVIDIA GTX 600 / AMD Radeon HD 7000 / Intel 6th-gen Core or newer).
+  Since 1.7.0 Mugetsu uses DirectX 12 on Windows: it is as fast as Vulkan or faster in the game and the graphics
+  driver holds far less memory. Without DirectX 12, or if it does not start, Mugetsu uses Vulkan and tells you so.
+  To choose yourself, **right-click Mugetsu's title bar** → Graphics: Automatic, Vulkan or DirectX 12
+  (try the other one if the window stays black or stutters).
 - **Graphics memory:** 2 GB minimum (with AQW's Quality set to **Low**), 4 GB or more recommended
-- **RAM:** 8 GB minimum, 16 GB recommended
-- **CPU with AVX2** (Windows and Linux): Intel 4th-gen Core (2013) or newer, AMD Ryzen or newer
+- **RAM:** 8 GB minimum, 16 GB recommended. With 8 GB, try the **Memory limit** in the right-click menu (3 GB or 4 GB).
+- **Any 64-bit processor** (since 1.7.0; older versions needed one with AVX2)
 
 ## How to use
 
@@ -71,12 +70,16 @@ where version 1.2 managed about 20, and draws each frame about **3.5× faster**.
 because it isn't notarized by Apple: open **System Settings → Privacy & Security**, click **Open Anyway**
 next to the message about Mugetsu, then confirm. The README inside the download has the steps for older macOS.
 
-**Settings:** right-click anywhere on the game for Mugetsu's menu: **Frame interpolation** (smoother motion on
-strong PCs, off by default), **Edge smoothing**, **Graphics**, **Show FPS**, **Full screen** and **Open log folder**.
+**Settings:** right-click anywhere on the game for Mugetsu's menu: **Edge smoothing**, **Performance mode**,
+**Frame interpolation** (smoother motion on strong PCs, off by default; with it on, also **Frame pacing** and an
+**FPS limit**), **Memory limit**, **Free memory now**, **Show FPS** and **Update reminders**. Point at a setting to
+see what it does. **F11** switches full screen.
 
 **Low FPS on a laptop or older PC?** In AQW's Options, set **Quality to Low**. Since 1.5.0, Medium and High
 cost much less than before on built-in graphics, but Low is still the fastest. If Mugetsu notices built-in
 graphics running slowly on Medium or High, it shows this tip once; it never changes the setting for you.
+Since 1.7.0 there is also **Performance mode** (right-click → Balanced or Fast): it draws the game with fewer
+pixels and stretches the picture over the window, a little softer and faster.
 
 ## Safety and privacy
 

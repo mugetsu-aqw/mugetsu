@@ -97,9 +97,10 @@ if ((prepare_only)); then
     exit 0
 fi
 
-# 4. Build. x86-64-v3 (AVX2) like the released builds; paths in the program are shortened.
+# 4. Build, for any 64-bit processor (x86-64; the builds up to 1.6.0 were x86-64-v3 and needed
+# AVX2); paths in the program are shortened.
 # When several prefixes match, the last one given wins: most specific last.
-flags=("-Ctarget-cpu=x86-64-v3"
+flags=("-Ctarget-cpu=x86-64"
     "--remap-path-prefix=$HOME=home" "--remap-path-prefix=$ruffle=ruffle")
 if [[ -n "${CARGO_HOME:-}" ]]; then
     flags+=("--remap-path-prefix=$CARGO_HOME=cargo")

@@ -31,8 +31,7 @@ Requirements
   - Graphics memory (VRAM): 2 GB minimum with Quality set to LOW in AQW's options, 4 GB or
     more recommended.
   - RAM: 8 GB minimum, 16 GB recommended.
-  - A CPU with AVX2: Intel Core 4th generation ("Haswell", 2013) or newer, AMD Ryzen or
-    newer.
+  - Any 64-bit processor.
   - The usual desktop libraries (ALSA or PipeWire/PulseAudio sound, fontconfig, zlib,
     OpenSSL 3, libudev); desktop systems have them already.
 
@@ -43,9 +42,11 @@ How to use
   3. Log in as usual.
   Closing the game window closes everything.
 
-  Settings: right-click anywhere on the game for Mugetsu's menu: Frame interpolation
-  (smoother motion on strong PCs, off by default), Edge smoothing, Graphics, Show FPS,
-  Full screen and Open log folder.
+  Settings: right-click anywhere on the game for Mugetsu's menu: Edge smoothing,
+  Performance mode (fewer pixels: faster on weak graphics), Graphics, Frame interpolation
+  (smoother motion on strong PCs, off by default; with it on, also Frame pacing and an FPS
+  limit), Memory limit, Free memory now, Show FPS and Update reminders. Point at a setting
+  to see what it does. F11 switches full screen.
 
 Safety and privacy
 ------------------

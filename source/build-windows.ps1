@@ -73,8 +73,9 @@ if ($PrepareOnly) {
     return
 }
 
-# 4. Build. x86-64-v3 (AVX2) like the released builds; paths in the program are shortened.
-$flags = @('-Ctarget-feature=+crt-static', '-Ctarget-cpu=x86-64-v3',
+# 4. Build, for any 64-bit processor (x86-64; the builds up to 1.6.0 were x86-64-v3 and needed
+# AVX2); paths in the program are shortened.
+$flags = @('-Ctarget-feature=+crt-static', '-Ctarget-cpu=x86-64',
     "--remap-path-prefix=$ruffle=ruffle", "--remap-path-prefix=$env:USERPROFILE=home")
 if ($env:CARGO_HOME) { $flags += "--remap-path-prefix=$env:CARGO_HOME=cargo" }
 if (-not $NoPgo) {

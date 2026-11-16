@@ -27,24 +27,20 @@ project. Use at your own risk; check AQW's Terms of Service if you are unsure.
 Requirements
 ------------
   - Windows 10 or 11, 64-bit
-  - A graphics card with Vulkan support (NVIDIA GTX 600, AMD Radeon HD 7000, Intel 6th-gen
-    Core or newer). On Intel and Qualcomm (Snapdragon) graphics, Mugetsu uses DirectX 12
-    instead (their Vulkan drivers crash or show a black window on several chips); since
-    version 1.1 it runs about as well as Vulkan. Without Vulkan, Mugetsu also uses
-    DirectX 12 and tells you so. If a graphics driver crashes when Vulkan starts, Mugetsu
-    says so, starts again on DirectX 12 and keeps using it on that PC (it tries Vulkan
-    again after a graphics driver update).
+  - A graphics card with DirectX 12 or Vulkan support (NVIDIA GTX 600, AMD Radeon HD 7000,
+    Intel 6th-gen Core or newer). Mugetsu uses DirectX 12: it is as fast as Vulkan or
+    faster in the game and the graphics driver holds far less memory. Without DirectX 12,
+    or if it does not start, Mugetsu uses Vulkan and tells you so.
     To choose yourself, right-click Mugetsu's title bar: Graphics: Automatic (recommended),
-    Vulkan or DirectX 12. Mugetsu restarts with your choice and remembers it. Try DirectX 12
-    if the game window stays black or stutters.
+    Vulkan or DirectX 12. Mugetsu restarts with your choice and remembers it. Try the other
+    one if the game window stays black or stutters.
   - Graphics memory (VRAM): 2 GB minimum with Quality set to LOW in AQW's options, 4 GB or
     more recommended. Crowded rooms use a lot of graphics memory, and Medium/High need much
     more of it: on a 2 GB card, High can run out in busy rooms (the screen may go black or
     stutter until you switch to Low or change rooms).
   - RAM: 8 GB minimum, 16 GB recommended. Memory use grows the more rooms and players you
     see in one session (AQW keeps loaded items), plus what the graphics driver itself uses.
-  - A CPU with AVX2: Intel Core 4th generation ("Haswell", 2013) or newer, AMD Ryzen or
-    newer. Some budget Celeron/Pentium laptop chips lack it; Mugetsu can't run on those.
+  - Any 64-bit processor.
 
 How to use
 ----------
@@ -55,9 +51,11 @@ How to use
   3. Log in as usual.
   Closing the game window closes everything.
 
-  Settings: right-click anywhere on the game for Mugetsu's menu: Frame interpolation
-  (smoother motion on strong PCs, off by default), Edge smoothing, Graphics, Show FPS,
-  Full screen and Open log folder.
+  Settings: right-click anywhere on the game for Mugetsu's menu: Edge smoothing,
+  Performance mode (fewer pixels: faster on weak graphics), Frame interpolation (smoother
+  motion on strong PCs, off by default; with it on, also Frame pacing and an FPS limit),
+  Memory limit, Free memory now, Show FPS and Update reminders. Point at a setting to see
+  what it does. F11 (or Alt+Enter) switches full screen.
 
 Safety and privacy
 ------------------

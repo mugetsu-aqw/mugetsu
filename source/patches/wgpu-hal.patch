@@ -650,7 +650,7 @@ index 63fb313..8137fcc 100644
          self.counters.bind_groups.sub(1);
      }
 diff --git a/src/dx12/mod.rs b/src/dx12/mod.rs
-index 285d635..a4d1da0 100644
+index 285d635..8d763a9 100644
 --- a/src/dx12/mod.rs
 +++ b/src/dx12/mod.rs
 @@ -86,6 +86,7 @@ mod device;
@@ -661,7 +661,35 @@ index 285d635..a4d1da0 100644
  mod sampler;
  mod shader_compilation;
  mod suballocation;
-@@ -749,6 +750,9 @@ struct CommandSignatures {
+@@ -121,9 +122,15 @@ use crate::auxil::{
+     },
+ };
+ 
++/// AQW build: never unloaded (Windows does that when the process ends). A device can be the
++/// last thing to go, after the instance and the adapter: on wgpu-core's background drop thread
++/// (see `drop_finished_encoders`), when the last finished command buffers held the last
++/// reference to it. It then let go of d3d12.dll (and the shader compiler) before its pooled
++/// command encoders, and their release read the unloaded DLL: an access violation in
++/// D3D12Core.dll while closing, about two closes out of three on DirectX 12.
+ #[derive(Debug)]
+ struct DynLib {
+-    inner: libloading::Library,
++    inner: mem::ManuallyDrop<libloading::Library>,
+ }
+ 
+ impl DynLib {
+@@ -131,7 +138,9 @@ impl DynLib {
+     where
+         P: AsRef<std::ffi::OsStr>,
+     {
+-        unsafe { libloading::Library::new(filename) }.map(|inner| Self { inner })
++        unsafe { libloading::Library::new(filename) }.map(|inner| Self {
++            inner: mem::ManuallyDrop::new(inner),
++        })
+     }
+ 
+     unsafe fn get<T>(
+@@ -749,6 +758,9 @@ struct CommandSignatures {
      dispatch: Direct3D12::ID3D12CommandSignature,
  }
  
@@ -671,7 +699,7 @@ index 285d635..a4d1da0 100644
  struct DeviceShared {
      adapter: DxgiAdapter,
      zero_buffer: Direct3D12::ID3D12Resource,
-@@ -756,6 +760,15 @@ struct DeviceShared {
+@@ -756,6 +768,15 @@ struct DeviceShared {
      heap_views: descriptor::GeneralHeap,
      sampler_heap: sampler::SamplerHeap,
      private_caps: PrivateCapabilities,
@@ -687,7 +715,7 @@ index 285d635..a4d1da0 100644
  }
  
  unsafe impl Send for DeviceShared {}
-@@ -783,11 +796,22 @@ pub struct Device {
+@@ -783,11 +804,22 @@ pub struct Device {
      shader_cache: Mutex<ShaderCache>,
      counters: Arc<wgt::HalCounters>,
      limits: wgt::Limits,
@@ -710,7 +738,7 @@ index 285d635..a4d1da0 100644
          if self
              .shared
              .private_caps
-@@ -804,6 +828,12 @@ unsafe impl Sync for Device {}
+@@ -804,6 +836,12 @@ unsafe impl Sync for Device {}
  
  pub struct Queue {
      raw: Direct3D12::ID3D12CommandQueue,
@@ -723,7 +751,7 @@ index 285d635..a4d1da0 100644
      temp_lists: Mutex<Vec<Option<Direct3D12::ID3D12CommandList>>>,
      idle_fence: Direct3D12::ID3D12Fence,
      idle_event: Event,
-@@ -991,8 +1021,12 @@ pub struct CommandEncoder {
+@@ -991,8 +1029,12 @@ pub struct CommandEncoder {
      intermediate_copy_bufs: Vec<Buffer>,
  
      null_rtv_handle: descriptor::Handle,
@@ -737,7 +765,7 @@ index 285d635..a4d1da0 100644
      pass: PassState,
      temp: Temp,
  
-@@ -1017,7 +1051,22 @@ impl fmt::Debug for CommandEncoder {
+@@ -1017,7 +1059,22 @@ impl fmt::Debug for CommandEncoder {
  
  #[derive(Debug)]
  pub struct CommandBuffer {
@@ -761,7 +789,7 @@ index 285d635..a4d1da0 100644
  }
  
  impl crate::DynCommandBuffer for CommandBuffer {}
-@@ -1247,7 +1296,7 @@ struct SamplerIndexBuffer {
+@@ -1247,7 +1304,7 @@ struct SamplerIndexBuffer {
  #[derive(Debug)]
  pub struct BindGroup {
      handle_views: Option<descriptor::DualHandle>,
@@ -770,7 +798,31 @@ index 285d635..a4d1da0 100644
      dynamic_buffers: Vec<DynamicBuffer>,
  }
  
-@@ -1780,7 +1829,14 @@ impl crate::Queue for Queue {
+@@ -1345,10 +1402,11 @@ pub(super) struct ShaderCacheValue {
+     shader: CompiledShader,
+ }
+ 
++/// (AQW build: FXC's bytecode is `Precompiled` too, copied out of its blob, see
++/// `shader_compilation::compile_fxc`.)
+ #[derive(Clone)]
+ pub(super) enum CompiledShader {
+     Dxc(Direct3D::Dxc::IDxcBlob),
+-    Fxc(Direct3D::ID3DBlob),
+     Precompiled(Vec<u8>),
+ }
+ 
+@@ -1359,10 +1417,6 @@ impl CompiledShader {
+                 pShaderBytecode: unsafe { shader.GetBufferPointer() },
+                 BytecodeLength: unsafe { shader.GetBufferSize() },
+             },
+-            CompiledShader::Fxc(shader) => Direct3D12::D3D12_SHADER_BYTECODE {
+-                pShaderBytecode: unsafe { shader.GetBufferPointer() },
+-                BytecodeLength: unsafe { shader.GetBufferSize() },
+-            },
+             CompiledShader::Precompiled(shader) => Direct3D12::D3D12_SHADER_BYTECODE {
+                 pShaderBytecode: shader.as_ptr().cast(),
+                 BytecodeLength: shader.len(),
+@@ -1780,7 +1834,14 @@ impl crate::Queue for Queue {
          let mut temp_lists = self.temp_lists.lock();
          temp_lists.clear();
          for cmd_buf in command_buffers {
@@ -786,7 +838,7 @@ index 285d635..a4d1da0 100644
          }
  
          // Drain caller-staged waits before ExecuteCommandLists so the
-@@ -1798,6 +1854,12 @@ impl crate::Queue for Queue {
+@@ -1798,6 +1859,12 @@ impl crate::Queue for Queue {
              profiling::scope!("ID3D12CommandQueue::ExecuteCommandLists");
              unsafe { self.raw.ExecuteCommandLists(&temp_lists) }
          }
@@ -799,7 +851,7 @@ index 285d635..a4d1da0 100644
  
          unsafe { self.raw.Signal(&signal_fence.raw, signal_value) }
              .into_device_result("Signal fence")?;
-diff --git b/src/dx12/record.rs b/src/dx12/record.rs
+diff --git a/src/dx12/record.rs b/src/dx12/record.rs
 new file mode 100644
 index 0000000..68c2bdb
 --- /dev/null
@@ -1358,6 +1410,36 @@ index 0000000..68c2bdb
 +        }
 +    }
 +}
+diff --git a/src/dx12/shader_compilation.rs b/src/dx12/shader_compilation.rs
+index ff41e50..21d9306 100644
+--- a/src/dx12/shader_compilation.rs
++++ b/src/dx12/shader_compilation.rs
+@@ -254,7 +254,24 @@ fn compile_fxc(
+     match hr {
+         Ok(()) => {
+             let shader_data = shader_data.unwrap();
+-            Ok(super::CompiledShader::Fxc(shader_data))
++            // AQW build: the bytecode is copied out and the blob let go of right here, on the
++            // thread that compiled it. A compiled shader is kept in the device's shader cache
++            // and cloned by every thread that creates a pipeline with it, and the reference
++            // count of an FXC blob isn't safe to change from two threads at once: it isn't
++            // interlocked (two threads taking 1,000,000 references each left it near
++            // 1,500,000; taking and dropping them ended the process with heap corruption).
++            // Mugetsu creates its pipelines on several threads at startup (ruffle_render_wgpu's
++            // `Descriptors::warm_up`), and about one DirectX 12 start in a hundred died there,
++            // more on a busy PC: 0xC0000374, an access violation in `load_shader`, or pipelines
++            // refused with "Unspecified error (0x80004005)".
++            let bytecode = unsafe {
++                core::slice::from_raw_parts(
++                    shader_data.GetBufferPointer().cast::<u8>(),
++                    shader_data.GetBufferSize(),
++                )
++            }
++            .to_vec();
++            Ok(super::CompiledShader::Precompiled(bytecode))
+         }
+         Err(e) => {
+             let mut full_msg = format!("FXC D3DCompile error ({e})");
 diff --git a/src/dx12/suballocation.rs b/src/dx12/suballocation.rs
 index 89c7dc4..052eeea 100644
 --- a/src/dx12/suballocation.rs
@@ -1541,10 +1623,10 @@ index aca5bbc..73e36db 100644
          let barriers = barriers.iter().map(|barrier| BufferBarrier {
              buffer: barrier.buffer.expect_downcast_ref(),
 diff --git a/src/lib.rs b/src/lib.rs
-index ca626f2..4a356c8 100644
+index ca626f2..25498f0 100644
 --- a/src/lib.rs
 +++ b/src/lib.rs
-@@ -247,6 +247,73 @@ extern crate wgpu_types as wgt;
+@@ -247,6 +247,154 @@ extern crate wgpu_types as wgt;
  #[macro_use]
  extern crate std;
  
@@ -1565,6 +1647,70 @@ index ca626f2..4a356c8 100644
 +    let result = f();
 +    AQW_TEXTURE_KIND.with(|k| k.set(was));
 +    result
++}
++
++/// AQW build (diagnostic): raw command buffers allocated from Vulkan command pools and not
++/// freed, for Ruffle's perf log.
++pub static AQW_COMMAND_BUFFERS: core::sync::atomic::AtomicUsize =
++    core::sync::atomic::AtomicUsize::new(0);
++
++/// AQW build (diagnostic): times a Vulkan command pool was reset while the GPU had not
++/// finished a submission one of its command buffers went out with (only looked for with
++/// `RUFFLE_LEAN_POOLS`, in pools over the limit).
++pub static AQW_EARLY_RESETS: core::sync::atomic::AtomicUsize =
++    core::sync::atomic::AtomicUsize::new(0);
++
++/// AQW build (diagnostic): Vulkan command pools replaced by `RUFFLE_LEAN_POOLS` so far.
++pub static AQW_POOLS_REPLACED: core::sync::atomic::AtomicUsize =
++    core::sync::atomic::AtomicUsize::new(0);
++
++/// AQW build, OFF unless `RUFFLE_LEAN_POOLS` is set (a `lean-pools` file next to Ruffle's
++/// exe; a number as the value changes the limit): a Vulkan command pool that holds more than
++/// this many command buffers when it is reset is destroyed and made anew.
++///
++/// wgpu records every render pass into two command buffers of its encoder's pool, a pool
++/// never gives a command buffer back, and wgpu keeps every pool for reuse: so each pool
++/// stays as large as the largest piece of a picture it ever recorded. NVIDIA's driver holds
++/// about 28 KB of the process's memory per command buffer: with 225 pools of 150 that is
++/// 950 MB in a 60-player room (34 thousand command buffers, where five pictures in flight
++/// use about four thousand), and several GB in the real game's crowded rooms. Freeing
++/// single command buffers gives nothing back (the pool keeps their memory, and the process
++/// grew by 400 MB when that was tried); resetting with RELEASE_RESOURCES gives back a
++/// tenth; destroying the pool gives it all back. With a limit of 64: 2,700 to 1,990 MB of
++/// commit in that room for 0.3 ms more per picture on the thread that finishes the encoders
++/// (the next use allocates its command buffers again).
++#[cfg(vulkan)]
++pub(crate) fn aqw_pool_limit() -> Option<usize> {
++    static LIMIT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
++    *LIMIT.get_or_init(|| {
++        let value = std::env::var("RUFFLE_LEAN_POOLS").ok()?;
++        Some(value.parse().ok().filter(|limit| *limit >= 16).unwrap_or(64))
++    })
++}
++
++/// AQW build, TEST SWITCHES (all off unless set): ways to make a Vulkan command pool give
++/// memory back when it is reset, without destroying it (see `aqw_pool_limit` for why
++/// destroying is not safe). `RUFFLE_POOL_RELEASE`: the reset asks for the pool's resources
++/// to be released. `RUFFLE_POOL_KEEP=<n>`: command buffers beyond `n` are freed after the
++/// reset. `RUFFLE_POOL_TRIM`: `vkTrimCommandPool` after the reset (Vulkan 1.1 and later).
++#[cfg(vulkan)]
++#[derive(Clone, Copy)]
++pub(crate) struct AqwPoolTest {
++    pub release: bool,
++    pub keep: Option<usize>,
++    pub trim: bool,
++}
++
++#[cfg(vulkan)]
++pub(crate) fn aqw_pool_test() -> AqwPoolTest {
++    static TEST: std::sync::OnceLock<AqwPoolTest> = std::sync::OnceLock::new();
++    *TEST.get_or_init(|| AqwPoolTest {
++        release: std::env::var_os("RUFFLE_POOL_RELEASE").is_some(),
++        keep: std::env::var("RUFFLE_POOL_KEEP")
++            .ok()
++            .and_then(|keep| keep.parse().ok()),
++        trim: std::env::var_os("RUFFLE_POOL_TRIM").is_some(),
++    })
 +}
 +
 +/// The kind of the texture being created on this thread (see `aqw_texture_kind`).
@@ -1597,6 +1743,23 @@ index ca626f2..4a356c8 100644
 +    const MB: u64 = 1024 * 1024;
 +    const CACHED_BLOCK_MB: u64 = 32;
 +    if kind != 2 {
++        // TEST SWITCH: `RUFFLE_POOLED_BLOCK_MB` gives the pooled layers (kind 1) fixed
++        // blocks of that many MB instead of the usual growing ones.
++        if kind == 1 {
++            if let Some(mb) = std::env::var("RUFFLE_POOLED_BLOCK_MB")
++                .ok()
++                .and_then(|mb| mb.parse::<u64>().ok())
++                .filter(|mb| *mb != 0)
++            {
++                let block = (mb * MB).clamp(4 * MB, 256 * MB);
++                log::info!("AQW build: pooled layers use {} MB GPU memory blocks", block / MB);
++                return AllocationSizes {
++                    min_device_memblock_size: block,
++                    max_device_memblock_size: block,
++                    ..base
++                };
++            }
++        }
 +        return base;
 +    }
 +    let block_mb = std::env::var("RUFFLE_CACHED_BLOCK_MB")
@@ -1618,7 +1781,7 @@ index ca626f2..4a356c8 100644
  /// DirectX12 API internals.
  #[cfg(dx12)]
  pub mod dx12;
-@@ -427,6 +494,7 @@ impl From<gpu_allocator::AllocationError> for DeviceError {
+@@ -427,6 +575,7 @@ impl From<gpu_allocator::AllocationError> for DeviceError {
  // and remove this type.
  // https://github.com/Traverse-Research/gpu-allocator/issues/295
  #[cfg_attr(not(any(dx12, vulkan)), expect(dead_code))]
@@ -1626,7 +1789,7 @@ index ca626f2..4a356c8 100644
  pub(crate) struct AllocationSizes {
      pub(crate) min_device_memblock_size: u64,
      pub(crate) max_device_memblock_size: u64,
-@@ -1445,6 +1513,29 @@ pub trait CommandEncoder: WasmNotSendSync + fmt::Debug {
+@@ -1445,6 +1594,29 @@ pub trait CommandEncoder: WasmNotSendSync + fmt::Debug {
      where
          I: Iterator<Item = <Self::A as Api>::CommandBuffer>;
  
@@ -1672,7 +1835,7 @@ index c9c48c3..acfcf2a 100644
  
  impl crate::Adapter for super::Adapter {
 diff --git a/src/vulkan/adapter.rs b/src/vulkan/adapter.rs
-index 196daf4..86b4610 100644
+index 196daf4..ce47f50 100644
 --- a/src/vulkan/adapter.rs
 +++ b/src/vulkan/adapter.rs
 @@ -2501,6 +2501,36 @@ impl super::Adapter {
@@ -1712,7 +1875,15 @@ index 196daf4..86b4610 100644
      pub fn get_physical_device_features(&self) -> &PhysicalDeviceFeatures {
          &self.phd_features
      }
-@@ -2948,7 +2978,7 @@ impl super::Adapter {
+@@ -2905,6 +2935,7 @@ impl super::Adapter {
+         let shared = Arc::new(super::DeviceShared {
+             raw: raw_device,
+             family_index,
++            aqw_timeline: Default::default(),
+             queue_index,
+             raw_queue,
+             drop_guard,
+@@ -2948,7 +2979,7 @@ impl super::Adapter {
              wait_semaphores: Mutex::new(SemaphoreList::new(SemaphoreListMode::Wait)),
          };
  
@@ -1721,7 +1892,7 @@ index 196daf4..86b4610 100644
  
          let buffer_device_address = enabled_extensions.contains(&khr::buffer_device_address::NAME);
  
-@@ -2959,8 +2989,20 @@ impl super::Adapter {
+@@ -2959,8 +2990,20 @@ impl super::Adapter {
                  physical_device: self.raw,
                  debug_settings: Default::default(),
                  buffer_device_address,
@@ -1743,7 +1914,7 @@ index 196daf4..86b4610 100644
  
          let desc_allocator = super::descriptor::DescriptorAllocator::new(
              if let Some(di) = self.phd_capabilities.descriptor_indexing {
-@@ -2973,6 +3015,7 @@ impl super::Adapter {
+@@ -2973,6 +3016,7 @@ impl super::Adapter {
          let device = super::Device {
              shared,
              mem_allocator: Mutex::new(mem_allocator),
@@ -1751,11 +1922,868 @@ index 196daf4..86b4610 100644
              desc_allocator: Mutex::new(desc_allocator),
              valid_ash_memory_types,
              naga_options,
+diff --git a/src/vulkan/command.rs b/src/vulkan/command.rs
+index 3ea853e..7371067 100644
+--- a/src/vulkan/command.rs
++++ b/src/vulkan/command.rs
+@@ -121,6 +121,11 @@ impl crate::CommandEncoder for super::CommandEncoder {
+ 
+     unsafe fn begin_encoding(&mut self, label: crate::Label) -> Result<(), crate::DeviceError> {
+         if self.free.is_empty() {
++            // AQW build: counted for the perf log.
++            crate::AQW_COMMAND_BUFFERS.fetch_add(
++                ALLOCATION_GRANULARITY as usize,
++                core::sync::atomic::Ordering::Relaxed,
++            );
+             let vk_info = vk::CommandBufferAllocateInfo::default()
+                 .command_pool(self.raw)
+                 .command_buffer_count(ALLOCATION_GRANULARITY);
+@@ -160,7 +165,10 @@ impl crate::CommandEncoder for super::CommandEncoder {
+             // VK_ERROR_INVALID_VIDEO_STD_PARAMETERS_KHR
+             super::map_host_device_oom_err(err)
+         }
+-        Ok(super::CommandBuffer { raw })
++        Ok(super::CommandBuffer {
++            raw,
++            aqw_submitted: alloc::sync::Arc::clone(&self.aqw_submitted),
++        })
+     }
+ 
+     unsafe fn discard_encoding(&mut self) {
+@@ -185,11 +193,95 @@ impl crate::CommandEncoder for super::CommandEncoder {
+         for (_, framebuffer) in self.framebuffers.drain() {
+             unsafe { self.device.raw.destroy_framebuffer(framebuffer, None) };
+         }
+-        let _ = unsafe {
+-            self.device
+-                .raw
+-                .reset_command_pool(self.raw, vk::CommandPoolResetFlags::default())
++        // AQW build: a pool that grew past the limit is replaced by a new one instead of
++        // being reset (see `crate::aqw_pool_limit`). Every command buffer of the pool is in
++        // `free` at this point and none is pending, which is what a reset needs as well.
++        if let Some(limit) = crate::aqw_pool_limit() {
++            if self.free.len() > limit {
++                // Destroying a pool while the GPU still runs one of its command buffers is
++                // a fault (a reset gets away with it): only when the GPU says it has
++                // finished every submission this pool's command buffers went out with.
++                let submitted = self
++                    .aqw_submitted
++                    .load(core::sync::atomic::Ordering::Relaxed);
++                let done = self.device.aqw_done();
++                if done.is_some_and(|done| done >= submitted) {
++                    let vk_info = vk::CommandPoolCreateInfo::default()
++                        .queue_family_index(self.device.family_index)
++                        .flags(vk::CommandPoolCreateFlags::TRANSIENT);
++                    // (If no new pool can be made, the old one is reset and kept.)
++                    if let Ok(pool) =
++                        unsafe { self.device.raw.create_command_pool(&vk_info, None) }
++                    {
++                        unsafe { self.device.raw.destroy_command_pool(self.raw, None) };
++                        let freed = self.free.len();
++                        let _ = crate::AQW_COMMAND_BUFFERS.try_update(
++                            core::sync::atomic::Ordering::Relaxed,
++                            core::sync::atomic::Ordering::Relaxed,
++                            |count| Some(count.saturating_sub(freed)),
++                        );
++                        self.free.clear();
++                        self.raw = pool;
++                        let earlier = crate::AQW_POOLS_REPLACED
++                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
++                        // (Said once on stderr, so a test run shows that it happens.)
++                        if earlier == 0 {
++                            use std::io::Write as _;
++                            let _ = std::writeln!(
++                                std::io::stderr(),
++                                "AQW: the first command pool is replaced ({freed} command buffers, limit {limit})"
++                            );
++                        }
++                        return;
++                    }
++                } else if let Some(done) = done {
++                    // What was suspected of the device lost in the tests: said in the log,
++                    // and the pool is reset and kept as it always was.
++                    let earlier = crate::AQW_EARLY_RESETS
++                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
++                    log::error!(
++                        "AQW: a command pool is reset while submission {submitted} is not finished (the GPU has finished {done}); kept, not replaced"
++                    );
++                    // Written to stderr itself as well, the first few times: the tests
++                    // capture the log and `eprintln!` of the thread this runs on.
++                    if earlier < 8 {
++                        use std::io::Write as _;
++                        let _ = std::writeln!(
++                            std::io::stderr(),
++                            "AQW EARLY POOL RESET: submission {submitted} not finished, the GPU has finished {done}"
++                        );
++                    }
++                }
++            }
++        }
++        // AQW build: the test switches of `crate::aqw_pool_test` (all off by default).
++        let test = crate::aqw_pool_test();
++        let flags = if test.release {
++            vk::CommandPoolResetFlags::RELEASE_RESOURCES
++        } else {
++            vk::CommandPoolResetFlags::default()
+         };
++        let _ = unsafe { self.device.raw.reset_command_pool(self.raw, flags) };
++        if let Some(keep) = test.keep {
++            if self.free.len() > keep {
++                // (After the reset every command buffer of the pool is in its initial state.)
++                let extra = self.free.split_off(keep);
++                unsafe { self.device.raw.free_command_buffers(self.raw, &extra) };
++                let freed = extra.len();
++                let _ = crate::AQW_COMMAND_BUFFERS.try_update(
++                    core::sync::atomic::Ordering::Relaxed,
++                    core::sync::atomic::Ordering::Relaxed,
++                    |count| Some(count.saturating_sub(freed)),
++                );
++            }
++        }
++        if test.trim && self.device.aqw_trim_supported() {
++            unsafe {
++                self.device
++                    .raw
++                    .trim_command_pool(self.raw, vk::CommandPoolTrimFlags::empty())
++            };
++        }
+     }
+ 
+     unsafe fn transition_buffers<'a, T>(&mut self, barriers: T)
+diff --git a/src/vulkan/descriptor.rs b/src/vulkan/descriptor.rs
+index 07df9b8..5961c3c 100644
+--- a/src/vulkan/descriptor.rs
++++ b/src/vulkan/descriptor.rs
+@@ -1,339 +1,339 @@
+-use alloc::vec::Vec;
+-use arrayvec::ArrayVec;
+-use ash::vk;
+-use hashbrown::{HashMap, HashSet};
+-
+-const POOL_MIN_SETS: u32 = 64;
+-const POOL_MAX_SETS: u32 = 512;
+-
+-/// The dynamic counts are tracked separately since dynamic textures/buffers
+-/// have distinct descriptor types compared to their non-dynamic counterparts.
+-#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
+-pub struct DescriptorCounts {
+-    pub sampler: u32,
+-    pub sampled_image: u32,
+-    pub storage_image: u32,
+-    pub uniform_buffer: u32,
+-    pub uniform_buffer_dynamic: u32,
+-    pub storage_buffer: u32,
+-    pub storage_buffer_dynamic: u32,
+-    pub acceleration_structure: u32,
+-}
+-
+-impl DescriptorCounts {
+-    fn total(&self) -> u32 {
+-        self.sampler
+-            + self.sampled_image
+-            + self.storage_image
+-            + self.uniform_buffer
+-            + self.uniform_buffer_dynamic
+-            + self.storage_buffer
+-            + self.storage_buffer_dynamic
+-            + self.acceleration_structure
+-    }
+-}
+-
+-#[derive(Debug)]
+-pub struct DescriptorSet {
+-    raw: vk::DescriptorSet,
+-    bucket_key: BucketKey,
+-    pool_index: usize,
+-}
+-
+-impl DescriptorSet {
+-    pub fn raw(&self) -> vk::DescriptorSet {
+-        self.raw
+-    }
+-}
+-
+-#[derive(Debug, PartialEq, Eq, Hash)]
+-struct BucketKey {
+-    counts: DescriptorCounts,
+-    update_after_bind: bool,
+-}
+-
+-struct Pool {
+-    raw: vk::DescriptorPool,
+-    capacity: u32,
+-    available: u32,
+-}
+-
+-/// Keeps track of all pools created with this bucket's [`BucketKey`].
+-#[derive(Default)]
+-struct Bucket {
+-    /// We keep track of all descriptor set layouts that might use this bucket.
+-    /// If the set becomes empty, the bucket is destroyed.
+-    layouts: HashSet<vk::DescriptorSetLayout>,
+-    pools: Vec<Pool>,
+-    available_sets: u32,
+-    allocated_sets: u32,
+-}
+-
+-impl Bucket {
+-    fn create_pool(
+-        &mut self,
+-        device: &ash::Device,
+-        key: &BucketKey,
+-        capacity_hint: u32,
+-    ) -> Result<(usize, &mut Pool), crate::DeviceError> {
+-        let index = self.pools.len();
+-        let pool = create_descriptor_pool(device, key, capacity_hint)?;
+-        self.available_sets += pool.capacity;
+-        self.pools.push(pool);
+-        Ok((index, self.pools.last_mut().unwrap()))
+-    }
+-}
+-
+-pub struct DescriptorAllocator {
+-    buckets: HashMap<BucketKey, Bucket>,
+-    max_update_after_bind_descriptors_in_all_pools: u32,
+-    update_after_bind_descriptors_in_all_pools: u32,
+-}
+-
+-impl super::BindGroupLayout {
+-    fn bucket_key(&self) -> BucketKey {
+-        let update_after_bind = self.contains_binding_arrays;
+-        let counts = self.desc_count.clone();
+-        BucketKey {
+-            counts,
+-            update_after_bind,
+-        }
+-    }
+-}
+-
+-impl DescriptorAllocator {
+-    pub fn new(max_update_after_bind_descriptors_in_all_pools: u32) -> Self {
+-        DescriptorAllocator {
+-            buckets: HashMap::default(),
+-            max_update_after_bind_descriptors_in_all_pools,
+-            update_after_bind_descriptors_in_all_pools: 0,
+-        }
+-    }
+-
+-    pub fn register_layout(
+-        &mut self,
+-        device: &ash::Device,
+-        layout: &super::BindGroupLayout,
+-    ) -> Result<(), crate::DeviceError> {
+-        let key = layout.bucket_key();
+-        let bucket = match self.buckets.entry(key) {
+-            hashbrown::hash_map::Entry::Occupied(occupied_entry) => occupied_entry.into_mut(),
+-            hashbrown::hash_map::Entry::Vacant(vacant_entry) => {
+-                let mut bucket = Bucket::default();
+-                // Create at least 1 pool upfront instead of doing this when
+-                // creating the first bind group.
+-                bucket.create_pool(device, vacant_entry.key(), POOL_MIN_SETS)?;
+-                vacant_entry.insert(bucket)
+-            }
+-        };
+-
+-        assert!(bucket.layouts.insert(layout.raw));
+-
+-        Ok(())
+-    }
+-
+-    pub fn unregister_layout(&mut self, device: &ash::Device, layout: &super::BindGroupLayout) {
+-        let key = layout.bucket_key();
+-        let bucket = self.buckets.get_mut(&key).unwrap();
+-
+-        assert!(bucket.layouts.remove(&layout.raw));
+-
+-        if bucket.layouts.is_empty() {
+-            // Remove the bucket and destroy any remaining pools.
+-            let bucket = self.buckets.remove(&key).unwrap();
+-            for pool in bucket.pools {
+-                assert_eq!(
+-                    pool.available, pool.capacity,
+-                    "pool is not empty, at least one DescriptorSet has not been freed"
+-                );
+-                unsafe { device.destroy_descriptor_pool(pool.raw, None) };
+-            }
+-        }
+-    }
+-
+-    pub unsafe fn alloc(
+-        &mut self,
+-        device: &ash::Device,
+-        layout: &super::BindGroupLayout,
+-    ) -> Result<DescriptorSet, crate::DeviceError> {
+-        let update_after_bind = layout.contains_binding_arrays;
+-        let total_descriptors = layout.desc_count.total();
+-
+-        if update_after_bind
+-            && self.max_update_after_bind_descriptors_in_all_pools
+-                - self.update_after_bind_descriptors_in_all_pools
+-                < total_descriptors
+-        {
+-            return Err(crate::DeviceError::OutOfMemory);
+-        }
+-
+-        let key = layout.bucket_key();
+-        let bucket = self.buckets.get_mut(&key).unwrap();
+-
+-        // Prefer smaller/older/fuller pools for new allocations to prevent
+-        // fragmentation and possibly fragmentation of hardware resources
+-        // (VK_ERROR_FRAGMENTATION)
+-        let pool = bucket
+-            .pools
+-            .iter_mut()
+-            .enumerate()
+-            .find(|(_, pool)| pool.available != 0);
+-
+-        let (pool_index, pool) = if let Some(pool) = pool {
+-            pool
+-        } else {
+-            let capacity_hint = bucket.allocated_sets;
+-            bucket.create_pool(device, &key, capacity_hint)?
+-        };
+-
+-        let vk_info = vk::DescriptorSetAllocateInfo::default()
+-            .descriptor_pool(pool.raw)
+-            .set_layouts(core::slice::from_ref(&layout.raw));
+-
+-        let raw = match unsafe { device.allocate_descriptor_sets(&vk_info) } {
+-            Ok(sets) => Ok(sets[0]),
+-            // We make sure not to exceed the size of the pool.
+-            Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY) => unreachable!(),
+-            // We only allocate from a pool if the nr and type of descriptors
+-            // used by a layout is the same as those specified at pool
+-            // creation time.
+-            //
+-            // > Additionally, if all sets allocated from the pool since it was
+-            // created or most recently reset use the same number of
+-            // descriptors (of each type) and the requested allocation also
+-            // uses that same number of descriptors (of each type),
+-            // then fragmentation must not cause an allocation failure.
+-            //
+-            // from https://docs.vulkan.org/refpages/latest/refpages/source/VkDescriptorPoolCreateInfo.html#_description
+-            Err(vk::Result::ERROR_FRAGMENTED_POOL) => unreachable!(),
+-            Err(err) => Err(super::map_host_device_oom_err(err)),
+-        }?;
+-
+-        pool.available -= 1;
+-        bucket.available_sets -= 1;
+-        bucket.allocated_sets += 1;
+-        if update_after_bind {
+-            self.update_after_bind_descriptors_in_all_pools += total_descriptors;
+-        }
+-
+-        Ok(DescriptorSet {
+-            raw,
+-            bucket_key: key,
+-            pool_index,
+-        })
+-    }
+-
+-    pub unsafe fn free(&mut self, device: &ash::Device, set: DescriptorSet) {
+-        let bucket = self.buckets.get_mut(&set.bucket_key).unwrap();
+-        let pool = bucket.pools.get_mut(set.pool_index).unwrap();
+-
+-        let result =
+-            unsafe { device.free_descriptor_sets(pool.raw, core::slice::from_ref(&set.raw())) };
+-        if let Err(err) = result {
+-            // vkFreeDescriptorSets is documented to return:
+-            // - VK_ERROR_UNKNOWN
+-            // - VK_ERROR_VALIDATION_FAILED (we shouldn't encounter this one)
+-            // wgpu-hal doesn't currently report errors in destroy functions.
+-            // Panic here for now. It might be ok to ignore the error but the
+-            // proper solution would probably be to lose the device.
+-            panic!("vkFreeDescriptorSets error: {err}, please report this error");
+-        }
+-
+-        pool.available += 1;
+-        bucket.available_sets += 1;
+-        bucket.allocated_sets -= 1;
+-        if set.bucket_key.update_after_bind {
+-            self.update_after_bind_descriptors_in_all_pools -= set.bucket_key.counts.total();
+-        }
+-
+-        // Do not immediately destroy empty pools since they might have
+-        // been recently created.
+-        // Destroy a pool only if it's empty and we have 1/4th its capacity
+-        // in other pools.
+-        // Note that this logic will never destroy the last pool.
+-        let pool = bucket.pools.last().unwrap();
+-        if pool.available == pool.capacity
+-            && bucket.available_sets - pool.capacity > pool.capacity / 4
+-        {
+-            let pool = bucket.pools.pop().unwrap();
+-            unsafe { device.destroy_descriptor_pool(pool.raw, None) };
+-            bucket.available_sets -= pool.capacity;
+-        }
+-    }
+-}
+-
+-impl Drop for DescriptorAllocator {
+-    fn drop(&mut self) {
+-        if !std::thread::panicking() {
+-            assert!(
+-                self.buckets.is_empty(),
+-                "buckets are not empty, at least one BGL has not been unregistered"
+-            )
+-        }
+-    }
+-}
+-
+-fn create_descriptor_pool(
+-    device: &ash::Device,
+-    key: &BucketKey,
+-    capacity_hint: u32,
+-) -> Result<Pool, crate::DeviceError> {
+-    let counts = &key.counts;
+-
+-    const NR_OF_DESCRIPTOR_TYPES: usize = 8;
+-
+-    use vk::DescriptorType as Dt;
+-    let counts: [_; NR_OF_DESCRIPTOR_TYPES] = [
+-        (Dt::SAMPLER, counts.sampler),
+-        (Dt::SAMPLED_IMAGE, counts.sampled_image),
+-        (Dt::STORAGE_IMAGE, counts.storage_image),
+-        (Dt::UNIFORM_BUFFER, counts.uniform_buffer),
+-        (Dt::UNIFORM_BUFFER_DYNAMIC, counts.uniform_buffer_dynamic),
+-        (Dt::STORAGE_BUFFER, counts.storage_buffer),
+-        (Dt::STORAGE_BUFFER_DYNAMIC, counts.storage_buffer_dynamic),
+-        (
+-            Dt::ACCELERATION_STRUCTURE_KHR,
+-            counts.acceleration_structure,
+-        ),
+-    ];
+-
+-    // bounded doubling growth strategy
+-    let mut capacity = capacity_hint
+-        .clamp(POOL_MIN_SETS, POOL_MAX_SETS)
+-        .next_power_of_two();
+-
+-    // Lower capacity to avoid overflowing `count * capacity` calculations
+-    // below. The resulting `capacity` might not be a power of 2 but that's
+-    // ok.
+-    for (_, count) in counts {
+-        capacity = (u32::MAX / count.max(1)).min(capacity);
+-    }
+-
+-    let pool_sizes = counts
+-        .into_iter()
+-        .filter(|&(_, count)| count != 0)
+-        .map(|(ty, count)| vk::DescriptorPoolSize {
+-            ty,
+-            descriptor_count: count * capacity,
+-        })
+-        .collect::<ArrayVec<_, NR_OF_DESCRIPTOR_TYPES>>();
+-
+-    let mut flags = vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET;
+-    if key.update_after_bind {
+-        flags |= vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND;
+-    };
+-
+-    let vk_info = vk::DescriptorPoolCreateInfo::default()
+-        .flags(flags)
+-        .max_sets(capacity)
+-        .pool_sizes(&pool_sizes);
+-
+-    let raw = unsafe { device.create_descriptor_pool(&vk_info, None) }
+-        .map_err(super::map_host_device_oom_and_fragmentation_err)?;
+-
+-    Ok(Pool {
+-        raw,
+-        capacity,
+-        available: capacity,
+-    })
+-}
++use alloc::vec::Vec;
++use arrayvec::ArrayVec;
++use ash::vk;
++use hashbrown::{HashMap, HashSet};
++
++const POOL_MIN_SETS: u32 = 64;
++const POOL_MAX_SETS: u32 = 512;
++
++/// The dynamic counts are tracked separately since dynamic textures/buffers
++/// have distinct descriptor types compared to their non-dynamic counterparts.
++#[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
++pub struct DescriptorCounts {
++    pub sampler: u32,
++    pub sampled_image: u32,
++    pub storage_image: u32,
++    pub uniform_buffer: u32,
++    pub uniform_buffer_dynamic: u32,
++    pub storage_buffer: u32,
++    pub storage_buffer_dynamic: u32,
++    pub acceleration_structure: u32,
++}
++
++impl DescriptorCounts {
++    fn total(&self) -> u32 {
++        self.sampler
++            + self.sampled_image
++            + self.storage_image
++            + self.uniform_buffer
++            + self.uniform_buffer_dynamic
++            + self.storage_buffer
++            + self.storage_buffer_dynamic
++            + self.acceleration_structure
++    }
++}
++
++#[derive(Debug)]
++pub struct DescriptorSet {
++    raw: vk::DescriptorSet,
++    bucket_key: BucketKey,
++    pool_index: usize,
++}
++
++impl DescriptorSet {
++    pub fn raw(&self) -> vk::DescriptorSet {
++        self.raw
++    }
++}
++
++#[derive(Debug, PartialEq, Eq, Hash)]
++struct BucketKey {
++    counts: DescriptorCounts,
++    update_after_bind: bool,
++}
++
++struct Pool {
++    raw: vk::DescriptorPool,
++    capacity: u32,
++    available: u32,
++}
++
++/// Keeps track of all pools created with this bucket's [`BucketKey`].
++#[derive(Default)]
++struct Bucket {
++    /// We keep track of all descriptor set layouts that might use this bucket.
++    /// If the set becomes empty, the bucket is destroyed.
++    layouts: HashSet<vk::DescriptorSetLayout>,
++    pools: Vec<Pool>,
++    available_sets: u32,
++    allocated_sets: u32,
++}
++
++impl Bucket {
++    fn create_pool(
++        &mut self,
++        device: &ash::Device,
++        key: &BucketKey,
++        capacity_hint: u32,
++    ) -> Result<(usize, &mut Pool), crate::DeviceError> {
++        let index = self.pools.len();
++        let pool = create_descriptor_pool(device, key, capacity_hint)?;
++        self.available_sets += pool.capacity;
++        self.pools.push(pool);
++        Ok((index, self.pools.last_mut().unwrap()))
++    }
++}
++
++pub struct DescriptorAllocator {
++    buckets: HashMap<BucketKey, Bucket>,
++    max_update_after_bind_descriptors_in_all_pools: u32,
++    update_after_bind_descriptors_in_all_pools: u32,
++}
++
++impl super::BindGroupLayout {
++    fn bucket_key(&self) -> BucketKey {
++        let update_after_bind = self.contains_binding_arrays;
++        let counts = self.desc_count.clone();
++        BucketKey {
++            counts,
++            update_after_bind,
++        }
++    }
++}
++
++impl DescriptorAllocator {
++    pub fn new(max_update_after_bind_descriptors_in_all_pools: u32) -> Self {
++        DescriptorAllocator {
++            buckets: HashMap::default(),
++            max_update_after_bind_descriptors_in_all_pools,
++            update_after_bind_descriptors_in_all_pools: 0,
++        }
++    }
++
++    pub fn register_layout(
++        &mut self,
++        device: &ash::Device,
++        layout: &super::BindGroupLayout,
++    ) -> Result<(), crate::DeviceError> {
++        let key = layout.bucket_key();
++        let bucket = match self.buckets.entry(key) {
++            hashbrown::hash_map::Entry::Occupied(occupied_entry) => occupied_entry.into_mut(),
++            hashbrown::hash_map::Entry::Vacant(vacant_entry) => {
++                let mut bucket = Bucket::default();
++                // Create at least 1 pool upfront instead of doing this when
++                // creating the first bind group.
++                bucket.create_pool(device, vacant_entry.key(), POOL_MIN_SETS)?;
++                vacant_entry.insert(bucket)
++            }
++        };
++
++        assert!(bucket.layouts.insert(layout.raw));
++
++        Ok(())
++    }
++
++    pub fn unregister_layout(&mut self, device: &ash::Device, layout: &super::BindGroupLayout) {
++        let key = layout.bucket_key();
++        let bucket = self.buckets.get_mut(&key).unwrap();
++
++        assert!(bucket.layouts.remove(&layout.raw));
++
++        if bucket.layouts.is_empty() {
++            // Remove the bucket and destroy any remaining pools.
++            let bucket = self.buckets.remove(&key).unwrap();
++            for pool in bucket.pools {
++                assert_eq!(
++                    pool.available, pool.capacity,
++                    "pool is not empty, at least one DescriptorSet has not been freed"
++                );
++                unsafe { device.destroy_descriptor_pool(pool.raw, None) };
++            }
++        }
++    }
++
++    pub unsafe fn alloc(
++        &mut self,
++        device: &ash::Device,
++        layout: &super::BindGroupLayout,
++    ) -> Result<DescriptorSet, crate::DeviceError> {
++        let update_after_bind = layout.contains_binding_arrays;
++        let total_descriptors = layout.desc_count.total();
++
++        if update_after_bind
++            && self.max_update_after_bind_descriptors_in_all_pools
++                - self.update_after_bind_descriptors_in_all_pools
++                < total_descriptors
++        {
++            return Err(crate::DeviceError::OutOfMemory);
++        }
++
++        let key = layout.bucket_key();
++        let bucket = self.buckets.get_mut(&key).unwrap();
++
++        // Prefer smaller/older/fuller pools for new allocations to prevent
++        // fragmentation and possibly fragmentation of hardware resources
++        // (VK_ERROR_FRAGMENTATION)
++        let pool = bucket
++            .pools
++            .iter_mut()
++            .enumerate()
++            .find(|(_, pool)| pool.available != 0);
++
++        let (pool_index, pool) = if let Some(pool) = pool {
++            pool
++        } else {
++            let capacity_hint = bucket.allocated_sets;
++            bucket.create_pool(device, &key, capacity_hint)?
++        };
++
++        let vk_info = vk::DescriptorSetAllocateInfo::default()
++            .descriptor_pool(pool.raw)
++            .set_layouts(core::slice::from_ref(&layout.raw));
++
++        let raw = match unsafe { device.allocate_descriptor_sets(&vk_info) } {
++            Ok(sets) => Ok(sets[0]),
++            // We make sure not to exceed the size of the pool.
++            Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY) => unreachable!(),
++            // We only allocate from a pool if the nr and type of descriptors
++            // used by a layout is the same as those specified at pool
++            // creation time.
++            //
++            // > Additionally, if all sets allocated from the pool since it was
++            // created or most recently reset use the same number of
++            // descriptors (of each type) and the requested allocation also
++            // uses that same number of descriptors (of each type),
++            // then fragmentation must not cause an allocation failure.
++            //
++            // from https://docs.vulkan.org/refpages/latest/refpages/source/VkDescriptorPoolCreateInfo.html#_description
++            Err(vk::Result::ERROR_FRAGMENTED_POOL) => unreachable!(),
++            Err(err) => Err(super::map_host_device_oom_err(err)),
++        }?;
++
++        pool.available -= 1;
++        bucket.available_sets -= 1;
++        bucket.allocated_sets += 1;
++        if update_after_bind {
++            self.update_after_bind_descriptors_in_all_pools += total_descriptors;
++        }
++
++        Ok(DescriptorSet {
++            raw,
++            bucket_key: key,
++            pool_index,
++        })
++    }
++
++    pub unsafe fn free(&mut self, device: &ash::Device, set: DescriptorSet) {
++        let bucket = self.buckets.get_mut(&set.bucket_key).unwrap();
++        let pool = bucket.pools.get_mut(set.pool_index).unwrap();
++
++        let result =
++            unsafe { device.free_descriptor_sets(pool.raw, core::slice::from_ref(&set.raw())) };
++        if let Err(err) = result {
++            // vkFreeDescriptorSets is documented to return:
++            // - VK_ERROR_UNKNOWN
++            // - VK_ERROR_VALIDATION_FAILED (we shouldn't encounter this one)
++            // wgpu-hal doesn't currently report errors in destroy functions.
++            // Panic here for now. It might be ok to ignore the error but the
++            // proper solution would probably be to lose the device.
++            panic!("vkFreeDescriptorSets error: {err}, please report this error");
++        }
++
++        pool.available += 1;
++        bucket.available_sets += 1;
++        bucket.allocated_sets -= 1;
++        if set.bucket_key.update_after_bind {
++            self.update_after_bind_descriptors_in_all_pools -= set.bucket_key.counts.total();
++        }
++
++        // Do not immediately destroy empty pools since they might have
++        // been recently created.
++        // Destroy a pool only if it's empty and we have 1/4th its capacity
++        // in other pools.
++        // Note that this logic will never destroy the last pool.
++        let pool = bucket.pools.last().unwrap();
++        if pool.available == pool.capacity
++            && bucket.available_sets - pool.capacity > pool.capacity / 4
++        {
++            let pool = bucket.pools.pop().unwrap();
++            unsafe { device.destroy_descriptor_pool(pool.raw, None) };
++            bucket.available_sets -= pool.capacity;
++        }
++    }
++}
++
++impl Drop for DescriptorAllocator {
++    fn drop(&mut self) {
++        if !std::thread::panicking() {
++            assert!(
++                self.buckets.is_empty(),
++                "buckets are not empty, at least one BGL has not been unregistered"
++            )
++        }
++    }
++}
++
++fn create_descriptor_pool(
++    device: &ash::Device,
++    key: &BucketKey,
++    capacity_hint: u32,
++) -> Result<Pool, crate::DeviceError> {
++    let counts = &key.counts;
++
++    const NR_OF_DESCRIPTOR_TYPES: usize = 8;
++
++    use vk::DescriptorType as Dt;
++    let counts: [_; NR_OF_DESCRIPTOR_TYPES] = [
++        (Dt::SAMPLER, counts.sampler),
++        (Dt::SAMPLED_IMAGE, counts.sampled_image),
++        (Dt::STORAGE_IMAGE, counts.storage_image),
++        (Dt::UNIFORM_BUFFER, counts.uniform_buffer),
++        (Dt::UNIFORM_BUFFER_DYNAMIC, counts.uniform_buffer_dynamic),
++        (Dt::STORAGE_BUFFER, counts.storage_buffer),
++        (Dt::STORAGE_BUFFER_DYNAMIC, counts.storage_buffer_dynamic),
++        (
++            Dt::ACCELERATION_STRUCTURE_KHR,
++            counts.acceleration_structure,
++        ),
++    ];
++
++    // bounded doubling growth strategy
++    let mut capacity = capacity_hint
++        .clamp(POOL_MIN_SETS, POOL_MAX_SETS)
++        .next_power_of_two();
++
++    // Lower capacity to avoid overflowing `count * capacity` calculations
++    // below. The resulting `capacity` might not be a power of 2 but that's
++    // ok.
++    for (_, count) in counts {
++        capacity = (u32::MAX / count.max(1)).min(capacity);
++    }
++
++    let pool_sizes = counts
++        .into_iter()
++        .filter(|&(_, count)| count != 0)
++        .map(|(ty, count)| vk::DescriptorPoolSize {
++            ty,
++            descriptor_count: count * capacity,
++        })
++        .collect::<ArrayVec<_, NR_OF_DESCRIPTOR_TYPES>>();
++
++    let mut flags = vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET;
++    if key.update_after_bind {
++        flags |= vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND;
++    };
++
++    let vk_info = vk::DescriptorPoolCreateInfo::default()
++        .flags(flags)
++        .max_sets(capacity)
++        .pool_sizes(&pool_sizes);
++
++    let raw = unsafe { device.create_descriptor_pool(&vk_info, None) }
++        .map_err(super::map_host_device_oom_and_fragmentation_err)?;
++
++    Ok(Pool {
++        raw,
++        capacity,
++        available: capacity,
++    })
++}
 diff --git a/src/vulkan/device.rs b/src/vulkan/device.rs
-index 948f77a..c256eae 100644
+index 948f77a..c052762 100644
 --- a/src/vulkan/device.rs
 +++ b/src/vulkan/device.rs
-@@ -906,6 +906,12 @@ impl super::Device {
+@@ -16,6 +16,45 @@ use super::{conv, descriptor::DescriptorCounts, RawTlasInstance};
+ use crate::TlasInstance;
+ 
+ impl super::DeviceShared {
++    /// AQW build: the last submission the GPU has finished, read from the fence's timeline
++    /// semaphore. None when that cannot be told (no submission yet, no timeline semaphores,
++    /// the fence destroyed, an error): the caller then takes nothing as finished.
++    pub(super) fn aqw_done(&self) -> Option<crate::FenceValue> {
++        // Held over the read: `destroy_fence` takes it before the semaphore goes.
++        let timeline = self.aqw_timeline.lock();
++        let semaphore = (*timeline)?;
++        // (Testing the test: `RUFFLE_TEST_POOL_EARLY` makes every submission look unfinished.)
++        static EARLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        if *EARLY.get_or_init(|| std::env::var_os("RUFFLE_TEST_POOL_EARLY").is_some()) {
++            return Some(0);
++        }
++        unsafe {
++            match *self.extension_fns.timeline_semaphore.as_ref()? {
++                super::ExtensionFn::Extension(ref ext) => {
++                    ext.get_semaphore_counter_value(semaphore)
++                }
++                super::ExtensionFn::Promoted => self.raw.get_semaphore_counter_value(semaphore),
++            }
++        }
++        .ok()
++    }
++
++    /// AQW build: whether `vkTrimCommandPool` is there to call: the instance and the device
++    /// both speak Vulkan 1.1 or later (asked once).
++    pub(super) fn aqw_trim_supported(&self) -> bool {
++        static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        *SUPPORTED.get_or_init(|| {
++            let device = unsafe {
++                self.instance
++                    .raw
++                    .get_physical_device_properties(self.physical_device)
++            }
++            .api_version;
++            self.instance.instance_api_version >= vk::API_VERSION_1_1
++                && device >= vk::API_VERSION_1_1
++        })
++    }
++
+     /// Set the name of `object` to `name`.
+     ///
+     /// If `name` contains an interior null byte, then the name set will be truncated to that byte.
+@@ -906,6 +945,12 @@ impl super::Device {
          else {
              return Ok(());
          };
@@ -1768,7 +2796,7 @@ index 948f77a..c256eae 100644
  
          let Some(memory_properties) = self.get_memory_properties() else {
              return Ok(());
-@@ -1187,10 +1193,14 @@ impl crate::Device for super::Device {
+@@ -1187,10 +1232,14 @@ impl crate::Device for super::Device {
              unsafe { self.shared.raw.destroy_image(image.raw, None) };
          })?;
  
@@ -1786,7 +2814,7 @@ index 948f77a..c256eae 100644
              .lock()
              .allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
                  name,
-@@ -1224,7 +1234,11 @@ impl crate::Device for super::Device {
+@@ -1224,7 +1273,11 @@ impl crate::Device for super::Device {
                  image.raw,
                  desc,
                  None,
@@ -1799,7 +2827,7 @@ index 948f77a..c256eae 100644
              )
          })
      }
-@@ -1242,6 +1256,13 @@ impl crate::Device for super::Device {
+@@ -1242,6 +1295,13 @@ impl crate::Device for super::Device {
                      log::warn!("Failed to free texture allocation: {err}");
                  }
              }
@@ -1813,7 +2841,29 @@ index 948f77a..c256eae 100644
              super::TextureMemory::Dedicated(memory) => unsafe {
                  self.shared.raw.free_memory(memory, None);
              },
-@@ -2958,6 +2979,23 @@ impl crate::Device for super::Device {
+@@ -1389,6 +1449,7 @@ impl crate::Device for super::Device {
+         Ok(super::CommandEncoder {
+             raw,
+             device: Arc::clone(&self.shared),
++            aqw_submitted: Default::default(),
+             active: vk::CommandBuffer::null(),
+             bind_point: vk::PipelineBindPoint::default(),
+             temp: super::Temp::default(),
+@@ -2547,6 +2608,13 @@ impl crate::Device for super::Device {
+     unsafe fn destroy_fence(&self, fence: super::Fence) {
+         match fence {
+             super::Fence::TimelineSemaphore(raw) => {
++                // AQW build: nothing asks this semaphore any more (see `aqw_done`).
++                {
++                    let mut timeline = self.shared.aqw_timeline.lock();
++                    if *timeline == Some(raw) {
++                        *timeline = None;
++                    }
++                }
+                 unsafe { self.shared.raw.destroy_semaphore(raw, None) };
+             }
+             super::Fence::FencePool(pool) => {
+@@ -2958,6 +3026,23 @@ impl crate::Device for super::Device {
              total_allocated_bytes,
              total_capacity_bytes,
          } = self.mem_allocator.lock().generate_report();
@@ -1838,10 +2888,22 @@ index 948f77a..c256eae 100644
          let allocations = allocations
              .into_iter()
 diff --git a/src/vulkan/mod.rs b/src/vulkan/mod.rs
-index 51e7414..3f40c11 100644
+index 51e7414..0c572cb 100644
 --- a/src/vulkan/mod.rs
 +++ b/src/vulkan/mod.rs
-@@ -557,6 +557,8 @@ impl Drop for DeviceShared {
+@@ -505,6 +505,11 @@ struct RenderPassKey {
+ struct DeviceShared {
+     raw: ash::Device,
+     family_index: u32,
++    /// AQW build: the timeline semaphore of the device's fence, noted at each submission and
++    /// forgotten when the fence is destroyed; it says which submissions the GPU has finished
++    /// (see `DeviceShared::aqw_done`). None before the first submission, and on a driver
++    /// without timeline semaphores.
++    aqw_timeline: Mutex<Option<vk::Semaphore>>,
+     queue_index: u32,
+     raw_queue: vk::Queue,
+     instance: Arc<InstanceShared>,
+@@ -557,6 +562,8 @@ impl Drop for DeviceShared {
  )]
  pub struct Device {
      mem_allocator: Mutex<gpu_allocator::vulkan::Allocator>,
@@ -1850,7 +2912,7 @@ index 51e7414..3f40c11 100644
      desc_allocator: Mutex<descriptor::DescriptorAllocator>,
      valid_ash_memory_types: u32,
      naga_options: naga::back::spv::Options<'static>,
-@@ -806,6 +808,9 @@ pub enum TextureMemory {
+@@ -806,6 +813,9 @@ pub enum TextureMemory {
      // shared memory in GPU allocator (owned by wgpu-hal)
      Allocation(gpu_allocator::vulkan::Allocation),
  
@@ -1860,7 +2922,59 @@ index 51e7414..3f40c11 100644
      // dedicated memory (owned by wgpu-hal)
      Dedicated(vk::DeviceMemory),
  
-@@ -1477,7 +1482,45 @@ impl crate::Queue for Queue {
+@@ -1048,6 +1058,10 @@ pub struct CommandEncoder {
+     raw: vk::CommandPool,
+     device: Arc<DeviceShared>,
+ 
++    /// AQW build: the latest submission any command buffer of this pool went out with
++    /// (0: none yet); shared with the pool's command buffers, which `Queue::submit` sees.
++    aqw_submitted: Arc<core::sync::atomic::AtomicU64>,
++
+     /// The current command buffer, if `self` is in the ["recording"]
+     /// state.
+     ///
+@@ -1106,6 +1120,13 @@ impl Drop for CommandEncoder {
+             // fields.
+             self.device.raw.destroy_command_pool(self.raw, None);
+         }
++        // AQW build: (the count for the perf log; buffers still out with a submission at
++        // this moment stay counted, which only happens when the device goes.)
++        let _ = crate::AQW_COMMAND_BUFFERS.try_update(
++            core::sync::atomic::Ordering::Relaxed,
++            core::sync::atomic::Ordering::Relaxed,
++            |count| Some(count.saturating_sub(self.free.len() + self.discarded.len())),
++        );
+ 
+         for (_, fb) in self.framebuffers.drain() {
+             unsafe { self.device.raw.destroy_framebuffer(fb, None) };
+@@ -1139,6 +1160,8 @@ impl fmt::Debug for CommandEncoder {
+ #[derive(Debug)]
+ pub struct CommandBuffer {
+     raw: vk::CommandBuffer,
++    /// AQW build: its pool's `CommandEncoder::aqw_submitted`.
++    aqw_submitted: Arc<core::sync::atomic::AtomicU64>,
+ }
+ 
+ impl crate::DynCommandBuffer for CommandBuffer {}
+@@ -1378,6 +1401,17 @@ impl crate::Queue for Queue {
+     ) -> Result<(), crate::DeviceError> {
+         let mut fence_raw = vk::Fence::null();
+ 
++        // AQW build: each command buffer's pool notes the submission it goes out with, and
++        // the device the semaphore that tells which submissions are finished (see
++        // `CommandEncoder::reset_all`).
++        for cmd in command_buffers {
++            cmd.aqw_submitted
++                .fetch_max(signal_value, core::sync::atomic::Ordering::Relaxed);
++        }
++        if let Fence::TimelineSemaphore(raw) = *signal_fence {
++            *self.device.aqw_timeline.lock() = Some(raw);
++        }
++
+         let mut wait_semaphores = SemaphoreList::new(SemaphoreListMode::Wait);
+         let mut signal_semaphores = SemaphoreList::new(SemaphoreListMode::Signal);
+ 
+@@ -1477,7 +1511,45 @@ impl crate::Queue for Queue {
              .map(|cmd| cmd.raw)
              .collect::<Vec<_>>();
  
