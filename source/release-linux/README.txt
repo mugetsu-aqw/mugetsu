@@ -42,7 +42,7 @@ How to use
   3. Log in as usual.
   Closing the game window closes everything.
 
-  Settings: right-click anywhere on the game for Mugetsu's menu: Edge smoothing,
+  Settings: right-click anywhere on the game for Mugetsu's menu:
   Performance mode (fewer pixels: faster on weak graphics), Graphics, Frame interpolation
   (smoother motion on strong PCs, off by default; with it on, also Frame pacing and an FPS
   limit), Memory limit, Free memory now, Show FPS and Update reminders. Point at a setting

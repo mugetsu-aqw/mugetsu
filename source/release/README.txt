@@ -38,8 +38,8 @@ Requirements
     more recommended. Crowded rooms use a lot of graphics memory, and Medium/High need much
     more of it: on a 2 GB card, High can run out in busy rooms (the screen may go black or
     stutter until you switch to Low or change rooms).
-  - RAM: 8 GB minimum, 16 GB recommended. Memory use grows the more rooms and players you
-    see in one session (AQW keeps loaded items), plus what the graphics driver itself uses.
+  - RAM: 8 GB minimum, 16 GB recommended. A crowded room needs about 1 to 1.3 GB (see the
+    Memory limit in the right-click menu), plus what the graphics driver itself uses.
   - Any 64-bit processor.
 
 How to use
@@ -51,7 +51,7 @@ How to use
   3. Log in as usual.
   Closing the game window closes everything.
 
-  Settings: right-click anywhere on the game for Mugetsu's menu: Edge smoothing,
+  Settings: right-click anywhere on the game for Mugetsu's menu:
   Performance mode (fewer pixels: faster on weak graphics), Frame interpolation (smoother
   motion on strong PCs, off by default; with it on, also Frame pacing and an FPS limit),
   Memory limit, Free memory now, Show FPS and Update reminders. Point at a setting to see

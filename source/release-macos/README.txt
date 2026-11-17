@@ -24,8 +24,8 @@ Requirements
 ------------
   - macOS 11 (Big Sur) or newer, Apple silicon or Intel
   - A Mac with Metal support (every Mac that runs macOS 11)
-  - RAM: 8 GB minimum, 16 GB recommended. Memory use grows the more rooms and players you
-    see in one session (AQW keeps loaded items).
+  - RAM: 8 GB minimum, 16 GB recommended. A crowded room needs about 1 to 1.3 GB (see the
+    Memory limit in the right-click menu).
   - Graphics memory: on Apple silicon the graphics chip shares the Mac's memory. Crowded
     rooms use a lot of it, and AQW's Quality setting (Medium/High) uses much more: if
     rooms get slow, set Quality to Low in AQW's options.
@@ -41,7 +41,7 @@ How to use
   3. Log in as usual.
   Closing the game window closes everything.
 
-  Settings: right-click anywhere on the game for Mugetsu's menu: Edge smoothing,
+  Settings: right-click anywhere on the game for Mugetsu's menu:
   Performance mode (fewer pixels: faster on weak graphics), Frame interpolation (smoother
   motion on strong Macs, off by default; with it on, also Frame pacing and an FPS limit),
   Memory limit, Free memory now, Show FPS and Update reminders. Point at a setting to see

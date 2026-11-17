@@ -183,10 +183,10 @@ index 739529ee3e6ec1d2abca7007382521d7771cefd7..44a79278bd64c505dc0c9926ef4bc42f
  impl<'gc> Deref for SwfMovie<'gc> {
 diff --git a/core/src/aqw_bench.rs b/core/src/aqw_bench.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..2d14a8564ea9ecc4827c0f5bc549f95f0d14da67
+index 0000000000000000000000000000000000000000..1a9b32deb54232ed66e97ba3115514a22a6aeda3
 --- /dev/null
 +++ b/core/src/aqw_bench.rs
-@@ -0,0 +1,244 @@
+@@ -0,0 +1,702 @@
 +//! AQW build: an offline load benchmark (a test, run on demand).
 +//!
 +//! Loads real AQW files from `AQW_CORPUS` (a folder, searched for .swf files) into one player
@@ -221,6 +221,7 @@ index 0000000000000000000000000000000000000000..2d14a8564ea9ecc4827c0f5bc549f95f
 +        let ptr = unsafe { System.alloc(layout) };
 +        if !ptr.is_null() {
 +            HEAP.fetch_add(layout.size() as i64, Ordering::Relaxed);
++            census::on_alloc(ptr, layout.size());
 +        }
 +        ptr
 +    }
@@ -229,19 +230,23 @@ index 0000000000000000000000000000000000000000..2d14a8564ea9ecc4827c0f5bc549f95f
 +        let ptr = unsafe { System.alloc_zeroed(layout) };
 +        if !ptr.is_null() {
 +            HEAP.fetch_add(layout.size() as i64, Ordering::Relaxed);
++            census::on_alloc(ptr, layout.size());
 +        }
 +        ptr
 +    }
 +
 +    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
++        census::on_free(ptr);
 +        unsafe { System.dealloc(ptr, layout) };
 +        HEAP.fetch_sub(layout.size() as i64, Ordering::Relaxed);
 +    }
 +
 +    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
++        census::on_free(ptr);
 +        let new = unsafe { System.realloc(ptr, layout, new_size) };
 +        if !new.is_null() {
 +            HEAP.fetch_add(new_size as i64 - layout.size() as i64, Ordering::Relaxed);
++            census::on_alloc(new, new_size);
 +        }
 +        new
 +    }
@@ -249,6 +254,277 @@ index 0000000000000000000000000000000000000000..2d14a8564ea9ecc4827c0f5bc549f95f
 +
 +#[global_allocator]
 +static ALLOCATOR: Counting = Counting;
++
++/// `AQW_CENSUS=1`: what holds the heap the loads left, by call stack. A sample: one allocation
++/// for every `STEP` bytes allocated, counted as that many bytes, with its call stack, until
++/// it is freed; `report` adds the live ones up by the function that asked and by stack (names
++/// from the test binary's .pdb). Windows only.
++#[cfg(windows)]
++mod census {
++    use std::cell::Cell;
++    use std::collections::HashMap;
++    use std::ffi::c_void;
++    use std::sync::Mutex;
++    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++
++    const DEPTH: usize = 30;
++    const STEP: usize = 1024;
++    type Stack = [usize; DEPTH];
++
++    pub static ENABLED: AtomicBool = AtomicBool::new(false);
++    static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
++    static LIVE: Mutex<Option<HashMap<usize, (usize, Stack)>>> = Mutex::new(None);
++
++    thread_local! {
++        /// Set while this thread is inside the census: its own allocations are not sampled.
++        static BUSY: Cell<bool> = const { Cell::new(false) };
++    }
++
++    #[repr(C)]
++    struct SymbolInfo {
++        size_of_struct: u32,
++        type_index: u32,
++        reserved: [u64; 2],
++        index: u32,
++        size: u32,
++        mod_base: u64,
++        flags: u32,
++        value: u64,
++        address: u64,
++        register: u32,
++        scope: u32,
++        tag: u32,
++        name_len: u32,
++        max_name_len: u32,
++        name: [u8; 4],
++    }
++
++    #[link(name = "kernel32")]
++    unsafe extern "system" {
++        fn RtlCaptureStackBackTrace(
++            skip: u32,
++            capture: u32,
++            trace: *mut *mut c_void,
++            hash: *mut u32,
++        ) -> u16;
++        fn GetCurrentProcess() -> *mut c_void;
++    }
++
++    #[link(name = "dbghelp", kind = "raw-dylib")]
++    unsafe extern "system" {
++        fn SymSetOptions(options: u32) -> u32;
++        fn SymInitialize(process: *mut c_void, search_path: *const u8, invade: i32) -> i32;
++        fn SymFromAddr(
++            process: *mut c_void,
++            address: u64,
++            displacement: *mut u64,
++            symbol: *mut SymbolInfo,
++        ) -> i32;
++    }
++
++    pub fn start() {
++        BUSY.with(|busy| busy.set(true));
++        *LIVE.lock().expect("census") = Some(HashMap::new());
++        BUSY.with(|busy| busy.set(false));
++        ENABLED.store(true, Ordering::Release);
++    }
++
++    #[inline]
++    pub fn on_alloc(ptr: *mut u8, size: usize) {
++        if !ENABLED.load(Ordering::Relaxed) {
++            return;
++        }
++        let before = ALLOCATED.fetch_add(size, Ordering::Relaxed);
++        let steps = (before + size) / STEP - before / STEP;
++        if steps == 0 || BUSY.try_with(|busy| busy.replace(true)).unwrap_or(true) {
++            return;
++        }
++        let mut stack: Stack = [0; DEPTH];
++        // SAFETY: `stack` has room for `DEPTH` pointers.
++        unsafe {
++            RtlCaptureStackBackTrace(
++                2,
++                DEPTH as u32,
++                stack.as_mut_ptr() as *mut *mut c_void,
++                std::ptr::null_mut(),
++            );
++        }
++        if let Ok(mut live) = LIVE.lock()
++            && let Some(live) = live.as_mut()
++        {
++            live.insert(ptr as usize, (steps * STEP, stack));
++        }
++        let _ = BUSY.try_with(|busy| busy.set(false));
++    }
++
++    #[inline]
++    pub fn on_free(ptr: *mut u8) {
++        if !ENABLED.load(Ordering::Relaxed)
++            || BUSY.try_with(|busy| busy.replace(true)).unwrap_or(true)
++        {
++            return;
++        }
++        if let Ok(mut live) = LIVE.lock()
++            && let Some(live) = live.as_mut()
++        {
++            live.remove(&(ptr as usize));
++        }
++        let _ = BUSY.try_with(|busy| busy.set(false));
++    }
++
++    /// Frames that only pass an allocation on: the caller is what asked for the memory.
++    fn passes_on(name: &str) -> bool {
++        const WRAPPERS: [&str; 22] = [
++            "alloc::",
++            "core::",
++            "std::",
++            "hashbrown::",
++            "indexmap::",
++            "smallvec::",
++            "gc_arena::",
++            "bytemuck",
++            "__rust",
++            "__rdl",
++            "__rg_",
++            "aqw_bench",
++            "RawVec",
++            "impl$",
++            "enum2$",
++            "tuple$",
++            "fnv::",
++            "slotmap::",
++            "ruffle_wstr::",
++            "ruffle_core::string::",
++            "ruffle_core::avm2::object::script_object::",
++            "?",
++        ];
++        std::env::var_os("AQW_CENSUS_RAW").is_none()
++            && WRAPPERS.iter().any(|wrapper| name.starts_with(wrapper))
++    }
++
++    pub fn report(loads: usize) {
++        ENABLED.store(false, Ordering::Release);
++        BUSY.with(|busy| busy.set(true));
++        let live = LIVE.lock().expect("census").take().unwrap_or_default();
++        // SAFETY: plain calls into dbghelp with this process's pseudo-handle.
++        // (The test binary names its .pdb without a folder: dbghelp is told where it is.)
++        let folder = std::env::current_exe()
++            .ok()
++            .and_then(|exe| exe.parent().map(|dir| dir.display().to_string()))
++            .unwrap_or_default();
++        let folder = std::ffi::CString::new(folder).unwrap_or_default();
++        let process = unsafe {
++            SymSetOptions(0x2);
++            let process = GetCurrentProcess();
++            let ok = SymInitialize(process, folder.as_ptr() as *const u8, 1);
++            if ok == 0 {
++                println!("  census: SymInitialize failed");
++            }
++            process
++        };
++        let mut names: HashMap<usize, String> = HashMap::new();
++        let mut name_of = |addr: usize| -> String {
++            names
++                .entry(addr)
++                .or_insert_with(|| {
++                    let mut buffer = vec![0u64; (size_of::<SymbolInfo>() + 1024) / 8];
++                    let symbol = buffer.as_mut_ptr() as *mut SymbolInfo;
++                    let mut displacement = 0u64;
++                    // SAFETY: the buffer holds a `SymbolInfo` and 1000 more bytes for the name.
++                    unsafe {
++                        (*symbol).size_of_struct = 88;
++                        (*symbol).max_name_len = 1000;
++                        if SymFromAddr(process, addr as u64 - 1, &mut displacement, symbol) == 0 {
++                            return format!("?{addr:x}");
++                        }
++                        let name = std::slice::from_raw_parts(
++                            (symbol as *const u8).add(84),
++                            (*symbol).name_len.min(1000) as usize,
++                        );
++                        let name = String::from_utf8_lossy(name).into_owned();
++                        match name.rfind("::h") {
++                            Some(at) if name.len() - at == 19 => name[..at].to_owned(),
++                            _ => name,
++                        }
++                    }
++                })
++                .clone()
++        };
++
++        let mut by_stack: HashMap<Stack, usize> = HashMap::new();
++        let mut total = 0usize;
++        for (bytes, stack) in live.values() {
++            *by_stack.entry(*stack).or_default() += *bytes;
++            total += *bytes;
++        }
++        let mut by_site: HashMap<String, usize> = HashMap::new();
++        let mut by_area: HashMap<String, usize> = HashMap::new();
++        let mut stacks: Vec<(usize, Vec<String>)> = Vec::new();
++        for (stack, bytes) in &by_stack {
++            let named: Vec<String> = stack
++                .iter()
++                .take_while(|addr| **addr != 0)
++                .map(|addr| name_of(*addr))
++                .filter(|name| !passes_on(name))
++                .collect();
++            let site = named.first().cloned().unwrap_or_else(|| "(unknown)".to_owned());
++            let area = site.split("::").take(3).collect::<Vec<_>>().join("::");
++            *by_site.entry(site).or_default() += *bytes;
++            *by_area.entry(area).or_default() += *bytes;
++            stacks.push((*bytes, named));
++        }
++        let mb = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
++        let per_load = |bytes: usize| bytes as f64 / 1024.0 / loads.max(1) as f64;
++        println!(
++            "  census: {:.1} MB alive in {} sampled allocations ({} stacks), {:.1} KB a load",
++            mb(total),
++            live.len(),
++            by_stack.len(),
++            per_load(total)
++        );
++        let mut areas: Vec<_> = by_area.into_iter().collect();
++        areas.sort_by(|a, b| b.1.cmp(&a.1));
++        println!("  census, by area:");
++        for (area, bytes) in areas.iter().take(30) {
++            println!(
++                "    {:7.1} MB {:5.1}% {:6.1} KB/load  {area}",
++                mb(*bytes),
++                *bytes as f64 * 100.0 / total.max(1) as f64,
++                per_load(*bytes)
++            );
++        }
++        let mut sites: Vec<_> = by_site.into_iter().collect();
++        sites.sort_by(|a, b| b.1.cmp(&a.1));
++        println!("  census, by the function that asked:");
++        for (site, bytes) in sites.iter().take(60) {
++            println!(
++                "    {:7.1} MB {:5.1}% {:6.1} KB/load  {site}",
++                mb(*bytes),
++                *bytes as f64 * 100.0 / total.max(1) as f64,
++                per_load(*bytes)
++            );
++        }
++        stacks.sort_by(|a, b| b.0.cmp(&a.0));
++        println!("  census, the biggest stacks:");
++        for (bytes, named) in stacks.iter().take(40) {
++            println!(
++                "    {:7.1} MB {:5.1}%  {}",
++                mb(*bytes),
++                *bytes as f64 * 100.0 / total.max(1) as f64,
++                named.iter().take(7).cloned().collect::<Vec<_>>().join(" < ")
++            );
++        }
++        BUSY.with(|busy| busy.set(false));
++    }
++}
++
++#[cfg(not(windows))]
++mod census {
++    pub fn start() {}
++    pub fn on_alloc(_: *mut u8, _: usize) {}
++    pub fn on_free(_: *mut u8) {}
++    pub fn report(_: usize) {}
++}
 +
 +const MB: f64 = 1024.0 * 1024.0;
 +
@@ -320,6 +596,10 @@ index 0000000000000000000000000000000000000000..2d14a8564ea9ecc4827c0f5bc549f95f
 +        player.tick(frame);
 +    }
 +    let base_heap = heap();
++    let census = std::env::var_os("AQW_CENSUS").is_some();
++    if census {
++        census::start();
++    }
 +
 +    let started = Instant::now();
 +    let (mut loaded, mut failed) = (0usize, 0usize);
@@ -395,6 +675,38 @@ index 0000000000000000000000000000000000000000..2d14a8564ea9ecc4827c0f5bc549f95f
 +        (end_heap - base_heap) as f64 / MB / loaded.max(1) as f64
 +    );
 +    println!("  shape tags: parsed {parsed}, shared {shared}");
++    if census {
++        census::report(loaded);
++    }
++
++    // `AQW_STAY_FRAMES=<n>`: everything stays on the stage for n more frames: what testing
++    // libraries that are all in use costs (their revival at the end of each GC cycle).
++    if let Some(frames) = std::env::var("AQW_STAY_FRAMES").ok().and_then(|n| n.parse::<usize>().ok()) {
++        let (tested0, revived0) = crate::library::library_gc_counts();
++        let (_, sum0, count0) = crate::player::gc_finalize_micros(true);
++        let stay_started = std::time::Instant::now();
++        let mut longest_tick = 0.0f64;
++        for _ in 0..frames {
++            let tick = std::time::Instant::now();
++            player.tick(frame);
++            longest_tick = longest_tick.max(tick.elapsed().as_secs_f64() * 1000.0);
++        }
++        let (tested, revived) = crate::library::library_gc_counts();
++        let (longest, sum, count) = crate::player::gc_finalize_micros(true);
++        let (alive, freed) = player.mutate_with_update_context(|context| {
++            (context.library.loaded_movie_count(), context.library.freed_movie_count())
++        });
++        println!(
++            "  all on stage, {frames} frames ({:.1} s): {} GC cycles, {} libraries tested, {} revived, {freed} freed, {alive} alive; steps at a cycle's end: longest {:.2} ms, {:.2} ms a cycle; longest frame {:.1} ms",
++            stay_started.elapsed().as_secs_f64(),
++            count - count0,
++            tested - tested0,
++            revived - revived0,
++            longest as f64 / 1000.0,
++            (sum - sum0) as f64 / 1000.0 / (count - count0).max(1) as f64,
++            longest_tick
++        );
++    }
 +
 +    // `AQW_UNLOAD=1`: takes every loader off the stage again and lets the collector run
 +    // (`AQW_UNLOAD_FRAMES` frames, default 2000; set `RUFFLE_GC_CYCLE_SECONDS=0.25` so it
@@ -415,21 +727,167 @@ index 0000000000000000000000000000000000000000..2d14a8564ea9ecc4827c0f5bc549f95f
 +                }
 +            }
 +        });
++        // `AQW_COLLECT_NOW=1`: what "Free memory now" does (`free_unused_libraries_now`),
++        // two frames after the loaders went.
++        if std::env::var_os("AQW_COLLECT_NOW").is_some() {
++            for _ in 0..2 {
++                player.tick(frame);
++            }
++            let heap_before = heap();
++            let (freed, ms) = player.free_unused_libraries_now();
++            let alive =
++                player.mutate_with_update_context(|context| context.library.loaded_movie_count());
++            println!(
++                "  free now: {freed} libraries freed in {ms:.0} ms, {alive} movies alive, heap {:.1} -> {:.1} MB",
++                (heap_before - base_heap) as f64 / MB,
++                (heap() - base_heap) as f64 / MB
++            );
++        }
 +        let frames: usize = std::env::var("AQW_UNLOAD_FRAMES")
 +            .ok()
 +            .and_then(|n| n.parse().ok())
 +            .unwrap_or(2000);
-+        for _ in 0..frames {
++        let (_, _, count0) = crate::player::gc_finalize_micros(true);
++        let mut curve = Vec::new();
++        for i in 0..frames {
 +            player.tick(frame);
++            if (i + 1) % (frames / 16).max(1) == 0 {
++                let alive = player
++                    .mutate_with_update_context(|context| context.library.loaded_movie_count());
++                let (_, _, count) = crate::player::gc_finalize_micros(false);
++                curve.push(format!("{} cycles: {alive}", count - count0));
++            }
 +        }
 +        let (alive, freed) = player.mutate_with_update_context(|context| {
 +            (context.library.loaded_movie_count(), context.library.freed_movie_count())
 +        });
++        let (longest, _, _) = crate::player::gc_finalize_micros(false);
 +        println!(
-+            "  off the stage again, {frames} frames later: {alive} movies alive, {freed} libraries freed, heap from the loads {:.1} MB",
-+            (heap() - base_heap) as f64 / MB
++            "  off the stage again, {frames} frames later: {alive} movies alive, {freed} libraries freed, heap from the loads {:.1} MB; alive after {}; longest step at a cycle's end {:.2} ms",
++            (heap() - base_heap) as f64 / MB,
++            curve.join(", "),
++            longest as f64 / 1000.0
 +        );
 +    }
++}
++
++/// The offline proof for `frame_lifecycle::early_scripts`, with a real colour-custom item:
++/// `AQW_CC_FILE=<its .swf> AQW_CC_CLASS=<one of its part classes>` (a part whose coloured
++/// pieces colour themselves from their first frame scripts). The part is made and put on the
++/// stage between two frames, as the game builds an avatar's parts when a load finishes or its
++/// load throttle's timer fires; then a picture is drawn, then a frame runs. Prints how many
++/// frame scripts had run at each point and how many clips the picture drew with their script
++/// still waiting (those are the ones seen in the colours they were drawn in). Run it once as
++/// it is and once with `RUFFLE_EARLY_SCRIPTS=1`.
++#[test]
++#[ignore]
++fn aqw_early_scripts() {
++    use crate::frame_lifecycle::early_scripts;
++    let file = std::env::var("AQW_CC_FILE").expect("AQW_CC_FILE: a colour-custom item's .swf");
++    let class = std::env::var("AQW_CC_CLASS").expect("AQW_CC_CLASS: a part class in it");
++    let bytes = std::fs::read(&file).expect("the file");
++
++    let player = PlayerBuilder::new().with_movie(root_movie()).build();
++    let mut player = player.lock().expect("player");
++    player.set_is_playing(true);
++    let frame = FloatDuration::from_millis(1000.0 / 24.0);
++    for _ in 0..3 {
++        player.tick(frame);
++    }
++    let loaded = player.update(|context| -> Result<(), String> {
++        let domain = context.avm2.stage_domain();
++        let mut activation = Activation::from_domain(context, domain);
++        let loader_class = activation.avm2().classes().loader;
++        let loader = loader_class
++            .construct(&mut activation, &[])
++            .map_err(|e| format!("{e:?}"))?;
++        let storage = ByteArrayStorage::from_vec(activation.context, bytes.clone());
++        let byte_array = ByteArrayObject::from_storage(activation.context, storage);
++        let load_bytes = AvmString::new_utf8(activation.gc(), "loadBytes");
++        loader
++            .call_public_property(
++                load_bytes,
++                FunctionArgs::from_slice(&[byte_array.into()]),
++                &mut activation,
++            )
++            .map_err(|e| format!("{e:?}"))?;
++        let stage = activation.context.stage.object2().ok_or("no AS3 stage")?;
++        let add_child = AvmString::new_utf8(activation.gc(), "addChild");
++        Value::from(stage)
++            .call_public_property(add_child, FunctionArgs::from_slice(&[loader]), &mut activation)
++            .map_err(|e| format!("{e:?}"))?;
++        Ok(())
++    });
++    loaded.expect("the load");
++    for _ in 0..12 {
++        player.tick(frame);
++    }
++
++    let scripts_before = early_scripts::all_scripts();
++    let (_, early_before, drawn_before) = early_scripts::counts();
++    // Between two frames: `new Part()`, `stage.addChild(part)`.
++    let made = player.update(|context| -> Result<(), String> {
++        let domain = context.avm2.stage_domain();
++        let mut activation = Activation::from_domain(context, domain);
++        let stage = Value::from(activation.context.stage.object2().ok_or("no AS3 stage")?);
++        fn name<'gc>(activation: &mut Activation<'_, 'gc>, text: &str) -> AvmString<'gc> {
++            AvmString::new_utf8(activation.gc(), text)
++        }
++        let get_child_at = name(&mut activation, "getChildAt");
++        let loader = stage
++            .call_public_property(get_child_at, FunctionArgs::from_slice(&[1.into()]), &mut activation)
++            .map_err(|e| format!("{e:?}"))?;
++        let mut value = loader;
++        for property in ["contentLoaderInfo", "applicationDomain"] {
++            let property = name(&mut activation, property);
++            value = value
++                .get_public_property(property, &mut activation)
++                .map_err(|e| format!("{e:?}"))?;
++        }
++        let get_definition = name(&mut activation, "getDefinition");
++        let class_name = name(&mut activation, &class);
++        let part_class = value
++            .call_public_property(
++                get_definition,
++                FunctionArgs::from_slice(&[class_name.into()]),
++                &mut activation,
++            )
++            .map_err(|e| format!("{e:?}"))?;
++        let part = part_class
++            .construct(&mut activation, FunctionArgs::from_slice(&[]))
++            .map_err(|e| format!("{e:?}"))?;
++        let add_child = name(&mut activation, "addChild");
++        stage
++            .call_public_property(add_child, FunctionArgs::from_slice(&[part]), &mut activation)
++            .map_err(|e| format!("{e:?}"))?;
++        Ok(())
++    });
++    made.expect("the part");
++    let scripts_made = early_scripts::all_scripts();
++    let (_, early_made, _) = early_scripts::counts();
++
++    player.render();
++    let (_, _, drawn_picture) = early_scripts::counts();
++
++    player.tick(frame);
++    let scripts_frame = early_scripts::all_scripts();
++    player.render();
++    let (_, _, drawn_after) = early_scripts::counts();
++    for _ in 0..5 {
++        player.tick(frame);
++    }
++    let scripts_later = early_scripts::all_scripts();
++
++    println!(
++        "early scripts {}: frame scripts run when the part was on the stage: {} ({} of them early); clips in the first picture with their script still waiting: {}; scripts run by the next frame: {}; waiting in the picture after it: {}; scripts run in five more frames: {}",
++        if early_scripts::enabled() { "ON" } else { "OFF" },
++        scripts_made - scripts_before,
++        early_made - early_before,
++        drawn_picture - drawn_before,
++        scripts_frame - scripts_made,
++        drawn_after - drawn_picture,
++        scripts_later - scripts_frame
++    );
 +}
 diff --git a/core/src/aqw_retention.rs b/core/src/aqw_retention.rs
 new file mode 100644
@@ -2771,7 +3229,7 @@ index 91557eaff7a20ca2b10477c3d8f74e8a6dddd788..f7a82ee0639c59b5c92fffe4d7d36d62
              .map(|(name, ns, prop)| (name.as_wstr().to_utf8_lossy(), ns, *prop))
              .collect();
 diff --git a/core/src/display_object.rs b/core/src/display_object.rs
-index 2425006896842d5dcd14a3e9e683481eddf6f8de..d84c715532271a97733c1950caa738b5e47eda4f 100644
+index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e57418a4a1 100644
 --- a/core/src/display_object.rs
 +++ b/core/src/display_object.rs
 @@ -32,11 +32,14 @@ mod avm2_button;
@@ -3506,7 +3964,18 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..d84c715532271a97733c1950caa738b5
          let mut node = self.parent();
          let mut matrix = self.base().matrix();
          while let Some(display_object) = node {
-@@ -2091,6 +2403,8 @@ pub trait TDisplayObject<'gc>:
+@@ -1953,6 +2265,10 @@ pub trait TDisplayObject<'gc>:
+     /// Set the parent of this display object.
+     #[no_dynamic]
+     fn set_parent(self, context: &mut UpdateContext<'gc>, parent: Option<DisplayObject<'gc>>) {
++        // AQW build: see `frame_lifecycle::early_scripts`.
++        if parent.is_some() {
++            crate::frame_lifecycle::early_scripts::changed(*context.frame_phase);
++        }
+         let had_parent = self.parent().is_some();
+         let write = Gc::write(context.gc(), self.base());
+         DisplayObjectBase::set_parent_ignoring_orphan_list(write, parent);
+@@ -2091,6 +2407,8 @@ pub trait TDisplayObject<'gc>:
  
      #[no_dynamic]
      fn set_scaling_grid(self, rect: Rectangle<Twips>) {
@@ -3515,7 +3984,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..d84c715532271a97733c1950caa738b5
          self.base().scaling_grid.set(rect);
      }
  
-@@ -2284,7 +2598,9 @@ pub trait TDisplayObject<'gc>:
+@@ -2284,7 +2602,9 @@ pub trait TDisplayObject<'gc>:
      /// Sets whether this display object has a scroll rectangle applied.
      #[no_dynamic]
      fn set_has_scroll_rect(self, value: bool) {
@@ -3526,7 +3995,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..d84c715532271a97733c1950caa738b5
      }
  
      /// Whether this display object has been created by ActionScript 1/2.
-@@ -2503,8 +2819,12 @@ pub trait TDisplayObject<'gc>:
+@@ -2503,8 +2823,12 @@ pub trait TDisplayObject<'gc>:
      fn pre_render(self, _context: &mut RenderContext<'_, 'gc>) {
          let this = self.base();
          this.clear_invalidate_flag();
@@ -3541,7 +4010,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..d84c715532271a97733c1950caa738b5
      }
  
      fn render_self(self, _context: &mut RenderContext<'_, 'gc>) {}
-@@ -2841,6 +3161,9 @@ pub trait TDisplayObject<'gc>:
+@@ -2841,6 +3165,9 @@ pub trait TDisplayObject<'gc>:
      /// If this object or any ancestor is marked as cacheAsBitmap, it will invalidate that cache.
      #[no_dynamic]
      fn invalidate_cached_bitmap(self) {
@@ -3551,7 +4020,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..d84c715532271a97733c1950caa738b5
          if self.base().invalidate_cached_bitmap() {
              // Don't inform ancestors if we've already done so this frame
              if let Some(parent) = self.parent() {
-@@ -3296,3 +3619,479 @@ impl<'gc> DisplayObjectWeak<'gc> {
+@@ -3296,3 +3623,479 @@ impl<'gc> DisplayObjectWeak<'gc> {
          }
      }
  }
@@ -7593,7 +8062,7 @@ index 8972325e2e8b14204a1683fae046903f067f36bd..527742cd1de7718b6f2a57ae3c0d87a0
 +    }
  }
 diff --git a/core/src/display_object/movie_clip.rs b/core/src/display_object/movie_clip.rs
-index 828033cd60d0d49980dacf07c80235787d152cb6..ea601dac808672abbc69a21c00c943f649fc8628 100644
+index 828033cd60d0d49980dacf07c80235787d152cb6..affc2ed28b49521971f63c20dd8358acaf6aaae6 100644
 --- a/core/src/display_object/movie_clip.rs
 +++ b/core/src/display_object/movie_clip.rs
 @@ -24,7 +24,7 @@ use crate::display_object::interactive::{
@@ -7855,7 +8324,16 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..ea601dac808672abbc69a21c00c943f6
          let current_frame = self.current_frame();
  
          let write = unlock!(Gc::write(context.gc(), self.0), MovieClipData, cell);
-@@ -2257,6 +2395,26 @@ impl<'gc> MovieClip<'gc> {
+@@ -2163,6 +2301,8 @@ impl<'gc> MovieClip<'gc> {
+                     // even if the frame is repeated due to goto.
+                     self.set_last_queued_script_frame(None);
+                     self.set_has_pending_script(true);
++                    // AQW build: see `frame_lifecycle::early_scripts`.
++                    crate::frame_lifecycle::early_scripts::changed(*context.frame_phase);
+                 }
+             }
+         } else if frame_scripts.len() > index {
+@@ -2257,6 +2397,26 @@ impl<'gc> MovieClip<'gc> {
  
      pub fn set_hit_area(self, mc: &Mutation<'gc>, hit_area: Option<DisplayObject<'gc>>) {
          unlock!(Gc::write(mc, self.0), MovieClipData, hit_area).set(hit_area);
@@ -7882,17 +8360,18 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..ea601dac808672abbc69a21c00c943f6
      }
  
      /// Resolve the AVM1 `hitArea` property for mouse picking, if set.
-@@ -2459,7 +2617,9 @@ impl<'gc> MovieClip<'gc> {
+@@ -2459,7 +2619,10 @@ impl<'gc> MovieClip<'gc> {
                  let is_fresh_frame = self.last_queued_script_frame() != Some(frame_id);
  
                  if is_fresh_frame && let Some(callable) = self.frame_script(frame_id) {
 +                    settle::work();
++                    crate::frame_lifecycle::early_scripts::script();
                      let callable = Avm2Value::from(callable);
 +                    let previous_script_frame = self.last_queued_script_frame();
  
                      self.set_last_queued_script_frame(Some(frame_id));
                      self.set_has_pending_script(false);
-@@ -2486,6 +2646,11 @@ impl<'gc> MovieClip<'gc> {
+@@ -2486,6 +2649,11 @@ impl<'gc> MovieClip<'gc> {
                              e,
                              "Error running AVM2 frame script",
                          );
@@ -7904,7 +8383,7 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..ea601dac808672abbc69a21c00c943f6
                      }
  
                      self.0
-@@ -2496,6 +2661,7 @@ impl<'gc> MovieClip<'gc> {
+@@ -2496,6 +2664,7 @@ impl<'gc> MovieClip<'gc> {
  
          let goto_info = self.0.queued_goto.take();
          if let Some(goto_info) = goto_info {
@@ -7912,7 +8391,7 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..ea601dac808672abbc69a21c00c943f6
              self.goto_frame_now(context, goto_info);
  
              // In SWFv10+, the `goto_frame_now` above will trigger an inner goto
-@@ -2512,24 +2678,47 @@ impl<'gc> MovieClip<'gc> {
+@@ -2512,24 +2681,90 @@ impl<'gc> MovieClip<'gc> {
  
      fn check_has_pending_script(self) {
          let has_pending_script = self.has_frame_script(self.0.current_frame.get());
@@ -7922,14 +8401,10 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..ea601dac808672abbc69a21c00c943f6
          self.set_has_pending_script(has_pending_script);
      }
 -}
--
+ 
 -impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
 -    fn base(self) -> Gc<'gc, DisplayObjectBase<'gc>> {
 -        HasPrefixField::as_prefix_gc(self.raw_interactive())
--    }
- 
--    fn id(self) -> CharacterId {
--        self.0.id()
 +    /// AQW build: whether `enter_frame` has nothing to do for this clip and all its children
 +    /// until something changes (see `display_object::settle`): every condition
 +    /// `enter_frame_all` acts on must be false here.
@@ -7951,9 +8426,54 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..ea601dac808672abbc69a21c00c943f6
 +            })
      }
  
+-    fn id(self) -> CharacterId {
+-        self.0.id()
++    /// AQW build: what the lean walks' check calls a clip in the log.
++    /// AQW build, for the log: this clip is being drawn while a script of its frame has yet
++    /// to run (see `frame_lifecycle::early_scripts`): what it is (the AS3 classes of it and
++    /// of what it sits in; no instance names), and what could have kept the script from
++    /// running: an ancestor the script walk skips, not being on the stage (drawn into a
++    /// bitmap), a script on the stack, or the mark not having been set.
++    fn log_drawn_waiting(self) {
++        use crate::avm2::object::TObject as _;
++        let mut classes = Vec::new();
++        let (mut settled_ancestor, mut on_stage, mut hidden) = (false, false, false);
++        let mut node: Option<DisplayObject<'gc>> = Some(self.into());
++        let mut first = true;
++        while let Some(object) = node {
++            if classes.len() < 7 {
++                classes.push(match object.object2() {
++                    Some(o) => o.instance_class().name().local_name().to_string(),
++                    None => "(no object)".to_string(),
++                });
++            }
++            if !first && object.is_settled() {
++                settled_ancestor = true;
++            }
++            if !object.visible() {
++                hidden = true;
++            }
++            if object.as_stage().is_some() {
++                on_stage = true;
++            }
++            first = false;
++            node = object.parent();
++        }
++        tracing::warn!(
++            target: "ruffle_aqw_perf",
++            "drawn before its frame script: {} (frame {} of {}, {}; on the stage: {on_stage}; hidden: {hidden}; an ancestor settled: {settled_ancestor}; settled itself: {}; a script running: {}; the mark set: {})",
++            classes.join(" < "),
++            self.current_frame(),
++            self.header_frames(),
++            if self.playing() { "playing" } else { "stopped" },
++            self.is_settled(),
++            self.is_executing_avm2_frame_script(),
++            crate::frame_lifecycle::early_scripts::marked()
++        );
+     }
+ 
 -    fn movie(self) -> SwfMovie<'gc> {
 -        self.0.movie()
-+    /// AQW build: what the lean walks' check calls a clip in the log.
 +    fn describe(self) -> String {
 +        format!(
 +            "clip {} {:?} (frame {} of {}, {})",
@@ -7971,7 +8491,7 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..ea601dac808672abbc69a21c00c943f6
          let skip_frame = self.base().should_skip_next_enter_frame();
          //Child removals from looping gotos appear to resolve in reverse order.
          for child in self.iter_render_list().rev() {
-@@ -2558,6 +2747,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
+@@ -2558,6 +2793,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
              let is_playing = self.playing();
  
              if is_playing {
@@ -7979,7 +8499,7 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..ea601dac808672abbc69a21c00c943f6
                  self.run_frame_internal(context, true, true, true);
              }
  
-@@ -2568,6 +2758,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
+@@ -2568,6 +2804,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
              let place_actions = self.unqueue_filtered(|q| q.unqueue_add());
  
              for (_, tag) in place_actions {
@@ -7987,7 +8507,7 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..ea601dac808672abbc69a21c00c943f6
                  let mut reader = data.read_from(tag.tag_start);
                  let version = match tag.tag_type {
                      QueuedTagAction::Place(v) => v,
-@@ -2581,8 +2772,9 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
+@@ -2581,8 +2818,9 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
          }
      }
  
@@ -7999,7 +8519,7 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..ea601dac808672abbc69a21c00c943f6
          // AVM1 code expects to execute in line with timeline instructions, so
          // it's exempted from frame construction.
          if self.movie().is_action_script_3()
-@@ -2590,12 +2782,16 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
+@@ -2590,12 +2828,16 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
          {
              let is_load_frame = !self.0.initialized();
              let needs_construction = if self.0.object2.get().is_none() {
@@ -8016,7 +8536,7 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..ea601dac808672abbc69a21c00c943f6
              self.0.unset_loop_queued();
  
              if needs_construction {
-@@ -2645,18 +2841,111 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
+@@ -2645,18 +2887,122 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
              self.check_has_pending_script();
          }
      }
@@ -8119,6 +8639,17 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..ea601dac808672abbc69a21c00c943f6
      }
  
      fn render_self(self, context: &mut RenderContext<'_, 'gc>) {
++        // AQW build, for the log: drawn while a frame script of this frame has yet to run
++        // (see `frame_lifecycle::early_scripts`).
++        if self.0.has_pending_script.get() && self.0.object2.get().is_some() {
++            let frame_id = self.0.queued_script_frame.get();
++            if self.last_queued_script_frame() != Some(frame_id)
++                && self.frame_script(frame_id).is_some()
++                && crate::frame_lifecycle::early_scripts::drawn_waiting()
++            {
++                self.log_drawn_waiting();
++            }
++        }
          if let Some(drawing) = self.drawing() {
              drawing.render(context);
 +            // AQW build: recorded for frame interpolation's next pictures (see `replay`).
@@ -8128,7 +8659,7 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..ea601dac808672abbc69a21c00c943f6
          }
          self.render_children(context);
      }
-@@ -2866,6 +3155,13 @@ impl<'gc> TDisplayObjectContainer<'gc> for MovieClip<'gc> {
+@@ -2866,6 +3212,13 @@ impl<'gc> TDisplayObjectContainer<'gc> for MovieClip<'gc> {
      }
  
      fn raw_container_mut(&self, mc: &Mutation<'gc>) -> RefMut<'_, ChildContainer<'gc>> {
@@ -8142,7 +8673,7 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..ea601dac808672abbc69a21c00c943f6
          let write = unlock!(Gc::write(mc, self.0), MovieClipData, cell);
          RefMut::map(write.borrow_mut(), |r| &mut r.container)
      }
-@@ -3182,6 +3478,11 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
+@@ -3182,6 +3535,11 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
                  .rev()
                  .filter(|child| child.as_interactive().is_none());
  
@@ -8154,7 +8685,7 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..ea601dac808672abbc69a21c00c943f6
              for child in interactive.into_iter().chain(non_interactive) {
                  // Mask children are not clickable
                  if child.clip_depth() > 0 || child.maskee().is_some() {
-@@ -3190,7 +3491,28 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
+@@ -3190,7 +3548,28 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
  
                  let mut res = if let Some(child) = child.as_interactive() {
                      if child.as_displayobject().movie().is_action_script_3() {
@@ -8184,7 +8715,7 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..ea601dac808672abbc69a21c00c943f6
                      } else {
                          let avm1_result =
                              child.mouse_pick_avm1(context, point, require_button_mode);
-@@ -3252,8 +3574,10 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
+@@ -3252,8 +3631,10 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
              }
  
              // Check drawing, because this selects the current clip, it must have mouse enabled
@@ -8197,7 +8728,7 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..ea601dac808672abbc69a21c00c943f6
                  && drawing.hit_test(local_matrix * point, &local_matrix)
              {
                  return if self.mouse_enabled() {
-@@ -3542,7 +3866,11 @@ impl<'gc, 'a> MovieClipShared<'gc> {
+@@ -3542,7 +3923,11 @@ impl<'gc, 'a> MovieClipShared<'gc> {
          reader: &mut SwfStream<'a>,
          version: u8,
      ) -> Result<(), Error> {
@@ -11125,7 +11656,7 @@ index 26d9d14348fb3172250662291b926901613bce3a..e4ad322d0ccdbfea6497fcc9d7e47bb3
              return;
          };
 diff --git a/core/src/frame_lifecycle.rs b/core/src/frame_lifecycle.rs
-index 91bdb52df526dbb0dbbcad9d1c179667ff629fce..a0434aa31f848f2f497a87a4e58f48b00b147298 100644
+index 91bdb52df526dbb0dbbcad9d1c179667ff629fce..0aea5c766e2f799ad8cdca44d6f26182b279f538 100644
 --- a/core/src/frame_lifecycle.rs
 +++ b/core/src/frame_lifecycle.rs
 @@ -72,6 +72,8 @@ pub enum FramePhase {
@@ -11156,6 +11687,199 @@ index 91bdb52df526dbb0dbbcad9d1c179667ff629fce..a0434aa31f848f2f497a87a4e58f48b0
  
          return;
      }
+@@ -206,6 +213,192 @@ fn run_frame_script_cleanup<'gc>(context: &mut UpdateContext<'gc>) {
+     }
+ }
+ 
++/// AQW build: the frame scripts of clips put on the stage between frames don't wait for the
++/// next frame.
++///
++/// Flash only draws after a frame. What an event between two frames puts on the stage (a
++/// timer, data from the server, a finished load, a click) has run its first frame's scripts
++/// by the time anybody sees it. Here a picture is drawn after every tick, and the tick handles
++/// those events after its frame (`Player::tick`), and with a fast screen there are many
++/// pictures between two frames: a clip made by such an event was drawn before its first frame
++/// script had run. AQW colours every colour-custom part of an avatar from that part's own
++/// first-frame script (`mcSetColor(this, "Trim", ...)`), so armour, hair, capes and helms
++/// showed in the colours they were drawn in, for up to a frame, whenever the game built them
++/// outside a frame (its load throttle is a timer).
++///
++/// So: once a clip was given a parent between frames, the frame scripts waiting on the stage
++/// are run when that event's code has returned (`Player::update`, and before a picture is
++/// drawn), before any picture. It is what a `gotoAndPlay` anywhere in that same code has
++/// always done (`run_inner_goto_frame` runs the whole stage's waiting frame scripts, as Flash
++/// does); a script that has run is not run again by the next frame. Clips that are not on the
++/// stage keep waiting, as before: their scripts mostly ask for the stage.
++///
++/// It is NOT the order Flash runs them in: Flash runs such a script in the next frame, after
++/// that frame's `enterFrame` and `frameConstructed` (the test `avm2/avm2_catchup_dobj` is
++/// Flash's own trace of it; `from_shumway/as3-loader/events/loader-events` shows Flash
++/// building a loaded movie inside a frame for the same reason). Running the next frame's
++/// script phase early is the price of drawing between frames at all. So it is off unless
++/// `RUFFLE_EARLY_SCRIPTS` is set: the desktop player sets it when AQW is played (a
++/// `no-early-scripts` file next to the exe, or `safe-drawing`, leaves it off), and the tests
++/// and other movies run in Flash's order.
++pub mod early_scripts {
++    use std::cell::Cell;
++
++    thread_local! {
++        /// A display object was given a parent, or a frame script was set for a clip's
++        /// frame, at a time when the frame's own script phase will not come by it any more
++        /// (see `changed`).
++        static PARENTED: Cell<bool> = const { Cell::new(false) };
++        /// How often that mark was set, by the phase it was set in (Enter, Construct,
++        /// FrameScripts, Exit, Idle).
++        static MARKS: Cell<[u64; 5]> = const { Cell::new([0; 5]) };
++        /// Lines written about clips drawn before their script (see `drawn_waiting`).
++        static LINES: Cell<u64> = const { Cell::new(0) };
++        static RUNNING: Cell<bool> = const { Cell::new(false) };
++        /// (runs that found a script, scripts run in them, clips drawn with their script
++        /// still waiting)
++        static COUNTS: Cell<(u64, u64, u64)> = const { Cell::new((0, 0, 0)) };
++        /// Every frame script run, early or not (for the offline proof in `aqw_bench`).
++        static ALL_SCRIPTS: Cell<u64> = const { Cell::new(0) };
++        /// (walks of the stage for waiting scripts, microseconds they took)
++        static WALKS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
++    }
++
++    /// For the log: what looking for waiting scripts costs: (walks of the stage, microseconds
++    /// in all), so far.
++    pub fn walks() -> (u64, u64) {
++        WALKS.get()
++    }
++
++    #[cfg_attr(not(test), allow(dead_code))]
++    pub fn all_scripts() -> u64 {
++        ALL_SCRIPTS.get()
++    }
++
++    /// Whether `run` has something to look at (asked before a picture is drawn: some code
++    /// between frames does not come through `Player::update`, a finished load for one).
++    pub fn waiting() -> bool {
++        PARENTED.get() && enabled()
++    }
++
++    pub fn enabled() -> bool {
++        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_EARLY_SCRIPTS").is_some())
++    }
++
++    /// A display object was given a parent, or a clip a script for the frame it is on. In
++    /// the first two phases of a frame the frame's script phase is still to come and walks
++    /// the whole stage. After that it may not come by any more: a script that makes clips
++    /// during the script phase (often inside the nested frame of a `gotoAndPlay`), an
++    /// `exitFrame` listener, and everything between frames.
++    #[inline]
++    pub fn changed(phase: super::FramePhase) {
++        use super::FramePhase;
++        if !matches!(phase, FramePhase::Enter | FramePhase::Construct) || RUNNING.get() {
++            if !PARENTED.replace(true) {
++                let index = match phase {
++                    FramePhase::Enter => 0,
++                    FramePhase::Construct => 1,
++                    FramePhase::FrameScripts => 2,
++                    FramePhase::Exit => 3,
++                    FramePhase::Idle => 4,
++                };
++                let mut marks = MARKS.get();
++                marks[index] += 1;
++                MARKS.set(marks);
++            }
++        }
++    }
++
++    /// For the log: how often the mark was set first in the script phase, the exit phase and
++    /// between frames.
++    pub fn marks() -> (u64, u64, u64) {
++        let marks = MARKS.get();
++        (marks[2], marks[3], marks[4])
++    }
++
++    /// A frame script is about to run.
++    #[inline]
++    pub fn script() {
++        ALL_SCRIPTS.set(ALL_SCRIPTS.get() + 1);
++        if RUNNING.get() {
++            COUNTS.with(|c| {
++                let (runs, scripts, drawn) = c.get();
++                c.set((runs, scripts + 1, drawn));
++            });
++        }
++    }
++
++    /// A clip is drawn while a frame script of its current frame has yet to run. Returns
++    /// whether to write a line about it: the first sixty, then one in two thousand.
++    pub fn drawn_waiting() -> bool {
++        let drawn = COUNTS.with(|c| {
++            let (runs, scripts, drawn) = c.get();
++            c.set((runs, scripts, drawn + 1));
++            drawn + 1
++        });
++        if !enabled() {
++            return false;
++        }
++        let lines = LINES.get();
++        if lines < 60 || drawn % 2000 == 0 {
++            LINES.set(lines + 1);
++            true
++        } else {
++            false
++        }
++    }
++
++    /// Whether the mark is set (for those lines).
++    pub fn marked() -> bool {
++        PARENTED.get()
++    }
++
++    /// For the log: (runs that found a script, scripts run early, clips drawn with their
++    /// script still waiting), so far.
++    pub fn counts() -> (u64, u64, u64) {
++        COUNTS.get()
++    }
++
++    /// Called when code that ran between frames has returned.
++    pub fn run(context: &mut crate::context::UpdateContext<'_>) {
++        use super::FramePhase;
++        if *context.frame_phase != FramePhase::Idle || !PARENTED.replace(false) || !enabled() {
++            return;
++        }
++        let stage = context.stage;
++        if !crate::display_object::TDisplayObject::movie(stage).is_action_script_3() {
++            return;
++        }
++        let before = COUNTS.get().1;
++        let started = std::time::Instant::now();
++        let mut walks = 0;
++        RUNNING.set(true);
++        // (A script run here can put more clips on the stage: a few rounds, and what is left
++        // then waits for the frame.)
++        for _ in 0..4 {
++            walks += 1;
++            *context.frame_phase = FramePhase::FrameScripts;
++            crate::display_object::TDisplayObject::run_frame_scripts(stage, context);
++            super::run_frame_script_cleanup(context);
++            *context.frame_phase = FramePhase::Idle;
++            if !PARENTED.replace(false) {
++                break;
++            }
++        }
++        RUNNING.set(false);
++        PARENTED.set(false);
++        let (all_walks, micros) = WALKS.get();
++        WALKS.set((all_walks + walks, micros + started.elapsed().as_micros() as u64));
++        if COUNTS.get().1 != before {
++            COUNTS.with(|c| {
++                let (runs, scripts, drawn) = c.get();
++                c.set((runs + 1, scripts, drawn));
++            });
++        }
++    }
++}
++
+ /// Run all previously-executed frame phases on a newly-constructed display
+ /// object.
+ ///
 diff --git a/core/src/html/layout.rs b/core/src/html/layout.rs
 index 367e4ad9cfa3cd7f3c62fa408a5f1e95494211f2..98bdcd2cc1f0089db338f3cefd4c890b18e6492d 100644
 --- a/core/src/html/layout.rs
@@ -11341,7 +12065,7 @@ index d76c1cba70d37735277fcffae9fff6c8bdaddc36..77047d48408d1390367b2b646e7d3c60
 +}
 \ No newline at end of file
 diff --git a/core/src/library.rs b/core/src/library.rs
-index b89702eba63cc58b817c3682f9e1219d54ab4d99..f6feab89d5e4c1fda08b031ca1994de70b43c124 100644
+index b89702eba63cc58b817c3682f9e1219d54ab4d99..ecec24464089f981047377a194ba0ad5148d8585 100644
 --- a/core/src/library.rs
 +++ b/core/src/library.rs
 @@ -8,6 +8,7 @@ use crate::font::{Font, FontDescriptor, FontLike, FontQuery, FontType};
@@ -11411,7 +12135,7 @@ index b89702eba63cc58b817c3682f9e1219d54ab4d99..f6feab89d5e4c1fda08b031ca1994de7
              swf,
              characters: HashMap::new(),
              imported_assets: HashMap::new(),
-@@ -366,34 +385,163 @@ impl ruffle_render::bitmap::BitmapSource for MovieLibrarySource<'_, '_> {
+@@ -366,34 +385,208 @@ impl ruffle_render::bitmap::BitmapSource for MovieLibrarySource<'_, '_> {
          match bitmap.bitmap_handle(backend) {
              Ok(handle) => Some(handle),
              Err(e) => {
@@ -11437,6 +12161,51 @@ index b89702eba63cc58b817c3682f9e1219d54ab4d99..f6feab89d5e4c1fda08b031ca1994de7
 +    /// Cycles to wait before testing again (doubles each time the library is found in use).
 +    wait: std::cell::Cell<u16>,
 +    backoff: std::cell::Cell<u16>,
++}
++
++/// AQW build: what the libraries' tests did so far (see `Library::sweep_movie_libraries`):
++/// tested, and of those found in use and revived. For the log and the load benchmark.
++struct LibraryGcCounts {
++    tested: std::sync::atomic::AtomicU64,
++    revived: std::sync::atomic::AtomicU64,
++}
++
++static LIBRARY_GC: LibraryGcCounts = LibraryGcCounts {
++    tested: std::sync::atomic::AtomicU64::new(0),
++    revived: std::sync::atomic::AtomicU64::new(0),
++};
++
++/// AQW build: (tested, revived) so far.
++pub fn library_gc_counts() -> (u64, u64) {
++    use std::sync::atomic::Ordering::Relaxed;
++    (LIBRARY_GC.tested.load(Relaxed), LIBRARY_GC.revived.load(Relaxed))
++}
++
++/// AQW build: one in this many of the loaded libraries, and of their characters, is tested in
++/// a GC cycle (at least 64 libraries and 4,000 characters): `RUFFLE_LIBRARY_TEST_SHARE`,
++/// default 2; 0 = only ever 64 and 4,000, as it was.
++fn test_share() -> usize {
++    static SHARE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
++    *SHARE.get_or_init(|| {
++        let share = std::env::var("RUFFLE_LIBRARY_TEST_SHARE")
++            .ok()
++            .and_then(|share| share.trim().parse::<usize>().ok())
++            .unwrap_or(2);
++        if share == 0 { usize::MAX } else { share }
++    })
++}
++
++/// AQW build: the most GC cycles a library found in use waits for its next test (the wait
++/// doubles from 1): `RUFFLE_LIBRARY_MAX_WAIT`, default 1 (it was 63).
++fn max_wait() -> u16 {
++    static WAIT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
++    *WAIT.get_or_init(|| {
++        std::env::var("RUFFLE_LIBRARY_MAX_WAIT")
++            .ok()
++            .and_then(|wait| wait.trim().parse::<u16>().ok())
++            .unwrap_or(1)
++            .clamp(1, 1023)
++    })
 +}
 +
 +/// AQW build: something that keeps a movie's library in use while it is alive.
@@ -11583,7 +12352,7 @@ index b89702eba63cc58b817c3682f9e1219d54ab4d99..f6feab89d5e4c1fda08b031ca1994de7
      }
  }
  
-@@ -428,6 +576,19 @@ pub struct Library<'gc> {
+@@ -428,6 +621,24 @@ pub struct Library<'gc> {
      /// A list of the symbols associated with specific AVM2 constructor
      /// prototypes.
      avm2_class_registry: Avm2ClassRegistry<'gc>,
@@ -11593,6 +12362,11 @@ index b89702eba63cc58b817c3682f9e1219d54ab4d99..f6feab89d5e4c1fda08b031ca1994de7
 +    /// needed; an address is forgotten when a new library is made at it).
 +    #[collect(require_static)]
 +    aqw_freed: (usize, FnvHashMap<usize, String>),
++
++    /// AQW build: the next choice of libraries to test takes all of them (see
++    /// `sweep_movie_libraries`, `Player::free_unused_libraries_now`).
++    #[collect(require_static)]
++    aqw_test_all: std::cell::Cell<bool>,
 +}
 +
 +impl<'gc> Library<'gc> {
@@ -11603,14 +12377,21 @@ index b89702eba63cc58b817c3682f9e1219d54ab4d99..f6feab89d5e4c1fda08b031ca1994de7
  }
  
  impl<'gc> Library<'gc> {
-@@ -441,17 +602,180 @@ impl<'gc> Library<'gc> {
+@@ -441,17 +652,222 @@ impl<'gc> Library<'gc> {
              default_font_names: Default::default(),
              default_font_cache: Default::default(),
              avm2_class_registry: Default::default(),
 +            aqw_freed: Default::default(),
++            aqw_test_all: Default::default(),
          }
      }
  
++    /// AQW build: the GC cycle that ends next picks every library for its test, whatever its
++    /// wait and the bounds (for "Free memory now").
++    pub fn test_all_libraries_next(&self) {
++        self.aqw_test_all.set(true);
++    }
++
 +    /// AQW build: what a movie is named by where a `'gc` handle can't be kept (a thread-local,
 +    /// a recording that outlives the render): its address. Only ever looked up through
 +    /// `library_at`, never turned back into a pointer.
@@ -11644,6 +12425,14 @@ index b89702eba63cc58b817c3682f9e1219d54ab4d99..f6feab89d5e4c1fda08b031ca1994de7
          self.movie_libraries.get_or_insert_mut(movie)
      }
  
++    /// AQW build: the sweep that follows the freeing of libraries is through: their movies
++    /// are gone, and their addresses can be given to new movies. A new movie of the same file
++    /// at such an address is not the freed one "still used" (that was reported once in a
++    /// session that freed 5,400 libraries: the same file loaded again).
++    pub fn forget_freed_addresses(&mut self) {
++        self.aqw_freed.1.clear();
++    }
++
 +    /// AQW build: warns (a limited number of times) when a freed library is looked up again.
 +    fn report_freed_lookup(&self, movie: SwfMovie<'gc>) {
 +        use std::sync::atomic::{AtomicU32, Ordering};
@@ -11711,9 +12500,11 @@ index b89702eba63cc58b817c3682f9e1219d54ab4d99..f6feab89d5e4c1fda08b031ca1994de7
 +                    .characters
 +                    .values()
 +                    .any(|c| character_in_use(fc, c));
++            LIBRARY_GC.tested.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 +            if in_use {
++                LIBRARY_GC.revived.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 +                library.aqw_gc.testing.set(false);
-+                let backoff = (library.aqw_gc.backoff.get() * 2 + 1).min(63);
++                let backoff = (library.aqw_gc.backoff.get() * 2 + 1).min(max_wait());
 +                library.aqw_gc.backoff.set(backoff);
 +                library.aqw_gc.wait.set(backoff);
 +                let mut revive = Revive { fc, revived: false };
@@ -11755,10 +12546,34 @@ index b89702eba63cc58b817c3682f9e1219d54ab4d99..f6feab89d5e4c1fda08b031ca1994de7
 +            }
 +        }
 +
-+        // Test a bounded amount per cycle: tested libraries that are still in use get revived in
-+        // one go at the end of marking, so this keeps that pause short.
++        // Test a bounded amount per cycle: the tests themselves, and handing the libraries
++        // found in use back to the collector, happen in one go at the end of marking (2 us a
++        // library; what only they reach is marked over the next frames, see
++        // `Player::collect_garbage`).
++        //
++        // The bound was 64 libraries and 4,000 characters a cycle whatever was loaded, and a
++        // library found in use waited up to 63 cycles for its next test. A cycle takes 10 s:
++        // 384 tests a minute at most, and ten minutes before a library whose player has left is
++        // looked at again. In a boss fight where players keep changing gear the game loads 400
++        // libraries a minute: they piled up (4,091 alive after eight minutes, 194 freed, 2 GB
++        // of heap), and memory only ever grew. Now a share of what is loaded is tested every
++        // cycle (`test_share`), and the wait is short (`max_wait`). Measured in the load
++        // benchmark with 4,825 libraries (2 GB), all taken off the stage at once: as it was,
++        // 1,559 were still alive after 70 cycles; with half tested a cycle, 354 after 4 cycles
++        // and none after 8, and the longest step at a cycle's end 8 ms with all in use (it was
++        // 13 to 18 ms with 53 tested a cycle, before that step was taken apart).
 +        const MAX_LIBRARIES: usize = 64;
 +        const MAX_CHARACTERS: usize = 4000;
++        let share = test_share();
++        let loaded_characters: usize = self
++            .movie_libraries
++            .0
++            .values()
++            .map(|library| library.characters.len())
++            .sum();
++        let max_libraries = (self.movie_libraries.0.len() / share).max(MAX_LIBRARIES);
++        let max_characters = (loaded_characters / share).max(MAX_CHARACTERS);
++        let all = self.aqw_test_all.replace(false);
 +        let (mut libraries, mut characters) = (0, 0);
 +        for library in self.movie_libraries.0.values() {
 +            let movie = library.swf;
@@ -11766,13 +12581,14 @@ index b89702eba63cc58b817c3682f9e1219d54ab4d99..f6feab89d5e4c1fda08b031ca1994de7
 +                continue;
 +            }
 +            let state = &library.aqw_gc;
-+            if state.wait.get() > 0 {
++            if state.wait.get() > 0 && !all {
 +                state.wait.set(state.wait.get() - 1);
 +                continue;
 +            }
-+            if libraries > 0
-+                && (libraries >= MAX_LIBRARIES
-+                    || characters + library.characters.len() > MAX_CHARACTERS)
++            if !all
++                && libraries > 0
++                && (libraries >= max_libraries
++                    || characters + library.characters.len() > max_characters)
 +            {
 +                continue;
 +            }
@@ -11785,7 +12601,7 @@ index b89702eba63cc58b817c3682f9e1219d54ab4d99..f6feab89d5e4c1fda08b031ca1994de7
      pub fn known_movies(&self) -> impl Iterator<Item = SwfMovie<'gc>> {
          self.movie_libraries.known_movies()
      }
-@@ -684,12 +1008,16 @@ impl<'gc> Library<'gc> {
+@@ -684,12 +1100,16 @@ impl<'gc> Library<'gc> {
          movie: Option<SwfMovie<'gc>>,
      ) -> Option<Font<'gc>> {
          let query = FontQuery::new(font_type, name.to_owned(), is_bold, is_italic);
@@ -11806,7 +12622,7 @@ index b89702eba63cc58b817c3682f9e1219d54ab4d99..f6feab89d5e4c1fda08b031ca1994de7
              if let Some((_, font)) = library.character_by_export_name(&WString::from_utf8(name)) {
                  // Exporting a font seems to override font lookup completely.
                  return if let Character::Font(font) = font {
-@@ -698,10 +1026,18 @@ impl<'gc> Library<'gc> {
+@@ -698,10 +1118,18 @@ impl<'gc> Library<'gc> {
                      None
                  };
              }
@@ -11826,7 +12642,7 @@ index b89702eba63cc58b817c3682f9e1219d54ab4d99..f6feab89d5e4c1fda08b031ca1994de7
          None
      }
  
-@@ -710,6 +1046,16 @@ impl<'gc> Library<'gc> {
+@@ -710,6 +1138,16 @@ impl<'gc> Library<'gc> {
      }
  
      pub fn register_global_font(&mut self, font: Font<'gc>) {
@@ -11874,7 +12690,7 @@ index 33adb41c563bc1990adab53f93826507a8653ded..1c1cc5cc8971d3ff3399ba37cfa031dd
              let movie = movie.unwrap();
              let flashvars = movie.parameters();
 diff --git a/core/src/player.rs b/core/src/player.rs
-index fce1e4dc01664b33e6592de7a176f5715f6785e1..65fd124dd32f0ad26390c84f8f02bf4eed8afad7 100644
+index fce1e4dc01664b33e6592de7a176f5715f6785e1..88361f4f69f9b3a27e577d7caaa2d7b8d7d2d25e 100644
 --- a/core/src/player.rs
 +++ b/core/src/player.rs
 @@ -145,6 +145,13 @@ pub struct MouseData<'gc> {
@@ -11973,7 +12789,7 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..65fd124dd32f0ad26390c84f8f02bf4e
              // The script probably tried implementing an FPS limiter with a busy loop.
              // We fooled the busy loop by pretending that more time has passed that actually did.
              // Then we need to actually pass this time, by decreasing frame_accumulator
-@@ -957,6 +993,160 @@ impl Player {
+@@ -957,6 +993,174 @@ impl Player {
          self.needs_render
      }
  
@@ -12071,11 +12887,25 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..65fd124dd32f0ad26390c84f8f02bf4e
 +        let (_, urls, total, distinct) =
 +            self.mutate_with_update_context(|context| context.library.movie_data_stats());
 +        let (parsed, shared) = crate::display_object::graphic::shared_shapes::counts();
++        // (How the freeing of unused libraries is doing: tested and found in use so far, the
++        // GC cycles so far and the longest end of a cycle since the last line.)
++        let (tested, in_use) = crate::library::library_gc_counts();
++        let (longest, _, cycles) = gc_finalize_micros(true);
++        // (Frame scripts of clips put on the stage between frames, see
++        // `frame_lifecycle::early_scripts`: run early so far, in how many goes, and clips drawn
++        // with a script still waiting.)
++        let (early_runs, early_scripts, drawn_waiting) =
++            crate::frame_lifecycle::early_scripts::counts();
++        let (early_walks, early_micros) = crate::frame_lifecycle::early_scripts::walks();
++        let (marks_scripts, marks_exit, marks_idle) =
++            crate::frame_lifecycle::early_scripts::marks();
 +        const MB: f64 = 1024.0 * 1024.0;
 +        format!(
-+            "{movies} loaded SWFs ({freed} freed so far; {urls} distinct URLs; SWF data {:.0} MB, {:.0} MB distinct; shape tags parsed {parsed}, shared {shared}), {gc_objects} GC objects",
++            "{movies} loaded SWFs ({freed} freed so far, {tested} tested, {in_use} found in use; {urls} distinct URLs; SWF data {:.0} MB, {:.0} MB distinct; shape tags parsed {parsed}, shared {shared}), {gc_objects} GC objects ({cycles} GC cycles, longest step at a cycle's end {:.1} ms); frame scripts run early {early_scripts} in {early_runs} goes ({early_walks} looks, {:.0} ms in all; asked for in the script phase {marks_scripts}, the exit phase {marks_exit}, between frames {marks_idle}), clips drawn before theirs {drawn_waiting}",
 +            total as f64 / MB,
-+            distinct as f64 / MB
++            distinct as f64 / MB,
++            longest as f64 / 1000.0,
++            early_micros as f64 / 1000.0
 +        )
 +    }
 +
@@ -12134,7 +12964,7 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..65fd124dd32f0ad26390c84f8f02bf4e
      pub fn background_color(&mut self) -> Option<Color> {
          self.mutate_with_update_context(|context| context.stage.background_color())
      }
-@@ -993,6 +1183,8 @@ impl Player {
+@@ -993,6 +1197,8 @@ impl Player {
  
          // Flash Player renders right away when the viewport is resized,
          // without waiting for the next frame.
@@ -12143,7 +12973,7 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..65fd124dd32f0ad26390c84f8f02bf4e
          self.needs_render = true;
      }
  
-@@ -1071,6 +1263,22 @@ impl Player {
+@@ -1071,6 +1277,22 @@ impl Player {
      }
  
      fn handle_focus_event(&mut self, event: PlayerEvent) -> bool {
@@ -12166,7 +12996,7 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..65fd124dd32f0ad26390c84f8f02bf4e
          if let PlayerEvent::FocusLost = event {
              self.mutate_with_update_context(|context| {
                  let focus_tracker = context.focus_tracker;
-@@ -1248,6 +1456,18 @@ impl Player {
+@@ -1248,6 +1470,18 @@ impl Player {
                  player_event_handled = true;
              }
  
@@ -12185,7 +13015,7 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..65fd124dd32f0ad26390c84f8f02bf4e
              // Fire event listener on appropriate object
              if let Some((listener_type, event_name, args)) = listener
                  && let Some(root_clip) = context.stage.root_clip()
-@@ -1509,7 +1729,20 @@ impl Player {
+@@ -1509,7 +1743,20 @@ impl Player {
                  && changed_mouse_buttons.is_empty()
                  && context.mouse_data.hovered.is_some();
  
@@ -12207,7 +13037,7 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..65fd124dd32f0ad26390c84f8f02bf4e
                  run_mouse_pick(context, true)
              } else {
                  None
-@@ -1601,6 +1834,19 @@ impl Player {
+@@ -1601,6 +1848,19 @@ impl Player {
              if !skip_mouse_hover
                  && !InteractiveObject::option_ptr_eq(cur_over_object, new_over_object)
              {
@@ -12227,7 +13057,7 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..65fd124dd32f0ad26390c84f8f02bf4e
                  // If the mouse button is down, the object the user clicked on grabs the focus
                  // and fires "drag" events.
                  if context.input.is_mouse_down(MouseButton::Left) {
-@@ -1739,6 +1985,9 @@ impl Player {
+@@ -1739,6 +1999,9 @@ impl Player {
                          MouseButton::Middle => ClipEvent::MiddlePress,
                          _ => unreachable!(),
                      };
@@ -12237,7 +13067,7 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..65fd124dd32f0ad26390c84f8f02bf4e
                      // Pressed on a hovered object.
                      if let Some(over_object) = context.mouse_data.hovered {
                          events.push((over_object, event));
-@@ -1992,6 +2241,7 @@ impl Player {
+@@ -1992,6 +2255,7 @@ impl Player {
  
      #[instrument(level = "debug", skip_all)]
      pub fn run_frame(&mut self) {
@@ -12245,7 +13075,7 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..65fd124dd32f0ad26390c84f8f02bf4e
          let frame_time = self.frame_time(750_000_000.0);
          let frame_time = Duration::from_nanos(frame_time as u64);
          let (mut execution_limit, may_execute_while_streaming) = match self.load_behavior {
-@@ -2026,10 +2276,21 @@ impl Player {
+@@ -2026,10 +2290,21 @@ impl Player {
          });
  
          self.needs_render = true;
@@ -12267,7 +13097,16 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..65fd124dd32f0ad26390c84f8f02bf4e
          let invalidated = self.enter_arena(|_, gc_root, _| gc_root.stage.invalidated());
  
          if invalidated {
-@@ -2041,11 +2302,26 @@ impl Player {
+@@ -2038,14 +2313,35 @@ impl Player {
+                 stage.broadcast_render(context);
+             });
+         }
++        // AQW build: clips put on the stage since the last frame by code that did not come
++        // through `update` (a finished load) run their first frame scripts before they are
++        // drawn (see `frame_lifecycle::early_scripts`; `update` does it).
++        if crate::frame_lifecycle::early_scripts::waiting() {
++            self.update(|_| {});
++        }
  
          let mut background_color = Color::WHITE;
  
@@ -12294,7 +13133,7 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..65fd124dd32f0ad26390c84f8f02bf4e
                  renderer: this.renderer.deref_mut(),
                  commands: CommandList::new(),
                  cache_draws: &mut cache_draws,
-@@ -2058,7 +2334,23 @@ impl Player {
+@@ -2058,7 +2354,23 @@ impl Player {
                  stage,
              };
  
@@ -12319,7 +13158,7 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..65fd124dd32f0ad26390c84f8f02bf4e
  
              #[cfg(feature = "egui")]
              {
-@@ -2067,6 +2359,13 @@ impl Player {
+@@ -2067,6 +2379,13 @@ impl Player {
                      .draw_debug_rects(&mut render_context, gc_root.dynamic_root);
              }
  
@@ -12333,7 +13172,7 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..65fd124dd32f0ad26390c84f8f02bf4e
              background_color =
                  if stage.window_mode() != WindowMode::Transparent || stage.is_fullscreen() {
                      stage.background_color().unwrap_or(Color::WHITE)
-@@ -2081,6 +2380,8 @@ impl Player {
+@@ -2081,6 +2400,8 @@ impl Player {
              (cache_draws, commands)
          });
  
@@ -12342,7 +13181,17 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..65fd124dd32f0ad26390c84f8f02bf4e
          self.renderer
              .submit_frame(background_color, commands, cache_draws);
  
-@@ -2384,11 +2685,59 @@ impl Player {
+@@ -2373,6 +2694,9 @@ impl Player {
+             let rval = func(context);
+ 
+             Self::run_actions(context);
++            // AQW build: what this put on the stage between frames runs its first frame
++            // scripts before a picture is drawn.
++            crate::frame_lifecycle::early_scripts::run(context);
+ 
+             rval
+         });
+@@ -2384,11 +2708,140 @@ impl Player {
          self.update_mouse_state(EnumSet::empty(), false, &mut false);
  
          // GC
@@ -12356,38 +13205,38 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..65fd124dd32f0ad26390c84f8f02bf4e
 +    /// `Dictionary`s can keep entries whose keys are alive and drop the rest (ephemerons)
 +    /// before anything is swept; `collect_debt` alone could run straight through to sweeping.
 +    /// Unused SWF libraries are freed at the same point (`Library::finalize_movie_libraries`).
++    ///
++    /// What happens in one go here, inside one frame, is a pause, and it was a long one with
++    /// many SWFs loaded (measured with 4,825 of them: 13 ms a cycle while 53 libraries were
++    /// tested, 57 ms with 1,150), for two reasons, both gone now:
++    /// - the last step borrowed the root data mutably through the write barrier, which made
++    ///   the collector trace all of it once more before sweeping: every character of every
++    ///   library (10 ms). That step only removes things, which needs no barrier;
++    /// - what only a tested library reaches was marked at once when the library was found in
++    ///   use (39 us a library). Now the cycle goes back to marking over frames, like
++    ///   everything else it marks, and comes here again when that is done
++    ///   (`RUFFLE_LIBRARY_REVIVE_AT_ONCE` = as it was).
 +    fn collect_garbage(arena: &mut GcArena) {
 +        use gc_arena::arena::CollectionPhase;
-+        let finalize = |marked: gc_arena::arena::MarkedArena<'_, Rootable![GcRoot<'_>]>| -> bool {
-+            marked.finalize(|fc, root| {
-+                let revived = {
-+                    let data = root.data.borrow();
-+                    let mut anchored = fnv::FnvHashSet::default();
-+                    data.avm2.movie_anchors(fc, &mut anchored);
-+                    let libraries_revived =
-+                        data.library.finalize_movie_libraries(fc, &mut anchored);
-+                    data.avm2.finalize_weak_dictionaries(fc, !libraries_revived)
-+                        || libraries_revived
-+                };
-+                if !revived {
-+                    let mut data = root.data.borrow_mut(fc);
-+                    let root_movie = data.root_swf;
-+                    data.library.sweep_movie_libraries(fc, root_movie);
-+                    data.avm2.prune_movie_anchors(fc);
-+                }
-+                revived
-+            })
-+        };
++        let finalize = Self::finalize_marked;
 +        if arena.collection_phase() != CollectionPhase::Sweeping {
 +            let Some(marked) = arena.mark_debt() else {
 +                return;
 +            };
-+            let mut revived = finalize(marked);
++            // (Timed, for the log and the load benchmark.)
++            let mut timed = FinalizeTimer(Instant::now(), false);
++            let (mut revived, libraries_revived) = finalize(marked);
++            if libraries_revived && !revive_at_once() {
++                // The libraries found in use are gray now. Nothing was removed and nothing is
++                // swept while marking goes on, and the tests run again in full when it is done:
++                // a library that comes into use meanwhile is found then.
++                return;
++            }
 +            while revived {
 +                let marked = arena
 +                    .finish_marking()
 +                    .expect("finish_marking always reaches the Marked phase");
-+                revived = finalize(marked);
++                revived = finalize(marked).0;
 +            }
 +            // Sweep right away: while the arena stays merely "marked", upgrading a weak pointer
 +            // (e.g. the orphan list running a removed clip's frame scripts) resurrects a dead
@@ -12396,14 +13245,95 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..65fd124dd32f0ad26390c84f8f02bf4e
 +            if let Some(marked) = arena.finish_marking() {
 +                marked.start_sweeping();
 +            }
++            timed.1 = true;
 +        }
++        let sweeping = arena.collection_phase() == CollectionPhase::Sweeping;
 +        arena.cycle_debt();
++        if sweeping && arena.collection_phase() != CollectionPhase::Sweeping {
++            Self::forget_freed_addresses(arena);
++        }
++    }
++
++    /// AQW build: see `Library::forget_freed_addresses` (called when a sweep is through).
++    fn forget_freed_addresses(arena: &mut GcArena) {
++        arena.mutate(|mc, root| root.data.borrow_mut(mc).library.forget_freed_addresses());
++    }
++
++    /// AQW build: what `collect_garbage` does with a fully marked arena: the tests of the
++    /// libraries and the weak dictionaries, and, in a round that revived nothing, the removal
++    /// of what is unused. -> (something was revived, of which libraries)
++    fn finalize_marked(
++        marked: gc_arena::arena::MarkedArena<'_, Rootable![GcRoot<'_>]>,
++    ) -> (bool, bool) {
++        marked.finalize(|fc, root| {
++            let (revived, libraries_revived) = {
++                let data = root.data.borrow();
++                let mut anchored = fnv::FnvHashSet::default();
++                data.avm2.movie_anchors(fc, &mut anchored);
++                let libraries_revived = data.library.finalize_movie_libraries(fc, &mut anchored);
++                (
++                    data.avm2.finalize_weak_dictionaries(fc, !libraries_revived)
++                        || libraries_revived,
++                    libraries_revived,
++                )
++            };
++            if !revived {
++                // SAFETY: nothing below stores a `Gc` pointer anywhere: libraries, class
++                // registry entries and anchors are removed, and the libraries' plain test
++                // marks are set. Without new pointers the root data needs no write barrier
++                // (which would have it traced again, see `collect_garbage`).
++                let mut data = unsafe { root.data.as_ref_cell() }.borrow_mut();
++                let root_movie = data.root_swf;
++                data.library.sweep_movie_libraries(fc, root_movie);
++                data.avm2.prune_movie_anchors(fc);
++            }
++            (revived, libraries_revived)
++        })
++    }
++
++    /// AQW build: one whole GC cycle, now: what is left of the marking, the end of the cycle
++    /// as `collect_garbage` does it (everything in one go), and all of the sweep.
++    fn finish_gc_cycle(arena: &mut GcArena) {
++        use gc_arena::arena::CollectionPhase;
++        if arena.collection_phase() != CollectionPhase::Sweeping {
++            let mut revived = true;
++            while revived {
++                let marked = arena
++                    .finish_marking()
++                    .expect("finish_marking always reaches the Marked phase");
++                revived = Self::finalize_marked(marked).0;
++            }
++            if let Some(marked) = arena.finish_marking() {
++                marked.start_sweeping();
++            }
++        }
++        if arena.collection_phase() == CollectionPhase::Sweeping {
++            arena.finish_cycle();
++            Self::forget_freed_addresses(arena);
++        }
++    }
++
++    /// AQW build, for "Free memory now": every library nothing uses is freed now, with all
++    /// other garbage, instead of over the next cycles. Two whole cycles: the first ends by
++    /// picking every library for its test, the second tests them and sweeps what was unused.
++    /// A pause (tens to a few hundred milliseconds with a big heap): only for a click.
++    /// -> (libraries freed, milliseconds)
++    pub fn free_unused_libraries_now(&mut self) -> (usize, f64) {
++        let started = Instant::now();
++        let freed_before =
++            self.mutate_with_update_context(|context| context.library.freed_movie_count());
++        self.mutate_with_update_context(|context| context.library.test_all_libraries_next());
++        for _ in 0..2 {
++            Self::finish_gc_cycle(&mut self.gc_arena.borrow_mut());
++        }
++        let freed = self.mutate_with_update_context(|context| context.library.freed_movie_count());
++        (freed - freed_before, started.elapsed().as_secs_f64() * 1000.0)
 +    }
 +
      pub fn flush_shared_objects(&mut self) {
          self.update(|context| {
              if let Some(mut avm1_activation) =
-@@ -2939,6 +3288,7 @@ impl PlayerBuilder {
+@@ -2939,6 +3392,7 @@ impl PlayerBuilder {
          let fake_movie = SwfMovie::new(gc_context, SwfMovieData::empty(player_version, None));
  
          let data = GcRootData {
@@ -12411,7 +13341,7 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..65fd124dd32f0ad26390c84f8f02bf4e
              audio_manager: AudioManager::new(),
              action_queue: ActionQueue::new(),
              avm1,
-@@ -2961,6 +3311,8 @@ impl PlayerBuilder {
+@@ -2961,6 +3415,8 @@ impl PlayerBuilder {
                  middle_pressed: None,
                  forced_cursor: None,
                  updating_drop_target: false,
@@ -12420,7 +13350,7 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..65fd124dd32f0ad26390c84f8f02bf4e
              },
              avm1_shared_objects: HashMap::new(),
              avm2_shared_objects: HashMap::new(),
-@@ -3043,6 +3395,8 @@ impl PlayerBuilder {
+@@ -3043,6 +3499,8 @@ impl PlayerBuilder {
                  frame_phase: Default::default(),
                  frame_accumulator: FloatDuration::ZERO,
                  recent_run_frame_timings: VecDeque::with_capacity(10),
@@ -12429,7 +13359,7 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..65fd124dd32f0ad26390c84f8f02bf4e
                  start_time: Instant::now(),
                  time_offset: 0,
                  time_til_next_timer: None,
-@@ -3214,6 +3568,108 @@ fn run_mouse_pick<'gc>(
+@@ -3214,6 +3672,108 @@ fn run_mouse_pick<'gc>(
      context: &mut UpdateContext<'gc>,
      require_button_mode: bool,
  ) -> Option<InteractiveObject<'gc>> {
@@ -12538,7 +13468,7 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..65fd124dd32f0ad26390c84f8f02bf4e
      context.stage.iter_render_list().rev().find_map(|level| {
          level.as_interactive().and_then(|l| {
              if l.as_displayobject().movie().is_action_script_3() {
-@@ -3282,3 +3738,247 @@ pub enum PlayerMode {
+@@ -3282,3 +3842,290 @@ pub enum PlayerMode {
      /// Represents the debug version of Flash Player, i.e. flashplayerdebugger.
      Debug,
  }
@@ -12554,6 +13484,49 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..65fd124dd32f0ad26390c84f8f02bf4e
 +            .and_then(|v| v.parse().ok())
 +            .unwrap_or(1)
 +    })
++}
++
++/// AQW build: the longest and the summed time of the steps at the ends of the GC's cycles so
++/// far, in microseconds, and how many cycles there were (see `Player::collect_garbage`: those
++/// steps are what a cycle cannot spread over frames).
++static FINALIZE_MICROS: [std::sync::atomic::AtomicU64; 3] = [
++    std::sync::atomic::AtomicU64::new(0),
++    std::sync::atomic::AtomicU64::new(0),
++    std::sync::atomic::AtomicU64::new(0),
++];
++
++/// (Since when, and whether the cycle ended with this step.)
++struct FinalizeTimer(Instant, bool);
++
++impl Drop for FinalizeTimer {
++    fn drop(&mut self) {
++        use std::sync::atomic::Ordering::Relaxed;
++        let micros = self.0.elapsed().as_micros() as u64;
++        FINALIZE_MICROS[0].fetch_max(micros, Relaxed);
++        FINALIZE_MICROS[1].fetch_add(micros, Relaxed);
++        if self.1 {
++            FINALIZE_MICROS[2].fetch_add(1, Relaxed);
++        }
++    }
++}
++
++/// AQW build: `RUFFLE_LIBRARY_REVIVE_AT_ONCE`: what the libraries found in use reach is marked
++/// in one go at the end of the cycle, as it was (see `Player::collect_garbage`).
++fn revive_at_once() -> bool {
++    static AT_ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *AT_ONCE.get_or_init(|| std::env::var_os("RUFFLE_LIBRARY_REVIVE_AT_ONCE").is_some())
++}
++
++/// AQW build: (longest, summed) microseconds of the steps at the ends of the GC's cycles and
++/// the number of cycles, so far; `reset` starts the longest over (for a log's window).
++pub fn gc_finalize_micros(reset: bool) -> (u64, u64, u64) {
++    use std::sync::atomic::Ordering::Relaxed;
++    let longest = if reset {
++        FINALIZE_MICROS[0].swap(0, Relaxed)
++    } else {
++        FINALIZE_MICROS[0].load(Relaxed)
++    };
++    (longest, FINALIZE_MICROS[1].load(Relaxed), FINALIZE_MICROS[2].load(Relaxed))
 +}
 +
 +/// AQW build: target seconds per full GC cycle (`RUFFLE_GC_CYCLE_SECONDS`, default 10; 0 = stock
@@ -13405,7 +14378,7 @@ index cacd85384de3de95e416350798fb2abdb20bd8b8..52efdaba9c917112d847837072894699
 +    }
 +}
 diff --git a/desktop/Cargo.toml b/desktop/Cargo.toml
-index e9a8c49aa8a8e6f5ae6eeec3c098146b798a1bca..b9efcd4829666a850bc7660c4951d7223b5e665a 100644
+index e9a8c49aa8a8e6f5ae6eeec3c098146b798a1bca..08139a297a73ba015af2d6cdeb8e932e9f318fb8 100644
 --- a/desktop/Cargo.toml
 +++ b/desktop/Cargo.toml
 @@ -12,6 +12,12 @@ workspace = true
@@ -13457,8 +14430,8 @@ index e9a8c49aa8a8e6f5ae6eeec3c098146b798a1bca..b9efcd4829666a850bc7660c4951d722
 +CompanyName = "Mugetsu"
 +LegalCopyright = "Mugetsu; based on Ruffle, Copyright © 2018 Ruffle LLC and Ruffle contributors"
 +# Keep equal to `mugetsu::VERSION` (desktop/src/mugetsu.rs).
-+ProductVersion = "1.7.0"
-+FileVersion = "1.7.0 (Ruffle 0.8.0-nightly.2026.11.10)"
++ProductVersion = "2.0.0"
++FileVersion = "2.0.0 (Ruffle 0.8.0-nightly.2026.11.10)"
  # InternalName should be the same as the module name
  InternalName = "ruffle_desktop"
 -OriginalFilename = "ruffle.exe"
@@ -15185,7 +16158,7 @@ literal 0
 HcmV?d00001
 
 diff --git a/desktop/src/app.rs b/desktop/src/app.rs
-index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d77074276d70d55 100644
+index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..1f648131aaf05071feaef7116f14d4ee1c66fdf0 100644
 --- a/desktop/src/app.rs
 +++ b/desktop/src/app.rs
 @@ -15,7 +15,7 @@ use ruffle_core::swf::HeaderExt;
@@ -15223,7 +16196,7 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
      min_window_size: LogicalSize<u32>,
      max_window_size: PhysicalSize<u32>,
      no_gui: bool,
-@@ -49,6 +56,724 @@ struct MainWindow {
+@@ -49,6 +56,736 @@ struct MainWindow {
      time: Instant,
      next_frame_time: Option<Instant>,
      event_loop_proxy: EventLoopProxy<RuffleEvent>,
@@ -15582,9 +16555,10 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
 +/// while there's room, so big cards are unaffected.
 +use crate::mugetsu::process_memory_mb;
 +
-+/// AQW build: what the system has promised the process (its committed memory), in MB.
++/// AQW build: what the memory limit is compared with, in MB: the figure Task Manager shows
++/// (see `mugetsu::task_manager_mb`; it was the committed memory until 2026-11-16).
 +fn process_commit_mb() -> u64 {
-+    process_memory_mb().1
++    crate::mugetsu::task_manager_mb()
 +}
 +
 +/// What one `free_memory` did, for the log.
@@ -15600,6 +16574,9 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
 +    /// Whether the heap's unused pages were returned on this thread (`after` has them) or
 +    /// are being returned in the background (a log line of its own says when and how much).
 +    heap_waited: bool,
++    /// The thorough way only: (loaded SWFs nothing used any more, now freed; the
++    /// milliseconds that took).
++    libraries: Option<(usize, f64)>,
 +}
 +
 +impl std::fmt::Display for Freed {
@@ -15615,7 +16592,11 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
 +            self.shapes,
 +            shapes + textures + heap,
 +            if self.heap_waited { "" } else { "; the heap's pages go back in the background" },
-+        )
++        )?;
++        if let Some((libraries, ms)) = self.libraries {
++            write!(f, "; before that, {libraries} loaded SWFs nothing used any more freed in {ms:.0} ms")?;
++        }
++        Ok(())
 +    }
 +}
 +
@@ -15647,6 +16628,9 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
 +/// `thorough` way: forced, on this thread and every worker, waited for.
 +fn free_memory(player: &mut ruffle_core::Player, thorough: bool) -> Freed {
 +    let before = process_memory_mb();
++    // (A click only: every loaded SWF nothing uses any more goes now, not within the next
++    // GC cycles: two whole cycles in one go, a pause the limit's own freeing must not make.)
++    let libraries = thorough.then(|| player.free_unused_libraries_now());
 +    let started = Instant::now();
 +    let shapes = ruffle_core::evict_unused_shapes(30);
 +    let shapes_done = Instant::now();
@@ -15699,6 +16683,7 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
 +            ms(textures_done, heap_done),
 +        ],
 +        heap_waited,
++        libraries,
 +    }
 +}
 +
@@ -15948,7 +16933,7 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
  }
  
  impl MainWindow {
-@@ -58,7 +783,191 @@ impl MainWindow {
+@@ -58,7 +795,191 @@ impl MainWindow {
              // surface also keeps the size it had before, as `GuiController::resize`
              // refuses to reconfigure it to a zero size.
              if !self.minimized && !self.occluded {
@@ -16141,7 +17126,7 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
              }
  
              // Important that we return here, or we'll get a feedback loop with egui
-@@ -66,15 +975,35 @@ impl MainWindow {
+@@ -66,15 +987,35 @@ impl MainWindow {
              return;
          }
  
@@ -16177,7 +17162,7 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
                  // How minimizing shows up on Windows; winit still has no
                  // `WindowEvent::Minimize`. (`Window::is_minimized` does exist by
                  // now, but it has to be polled, and it wouldn't tell us anything
-@@ -84,10 +1013,15 @@ impl MainWindow {
+@@ -84,10 +1025,15 @@ impl MainWindow {
  
                  if let Some(mut player) = self.player.get() {
                      let viewport_scale_factor = self.gui.window().scale_factor();
@@ -16196,7 +17181,7 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
                      });
                  }
                  self.gui.window().request_redraw();
-@@ -106,6 +1040,10 @@ impl MainWindow {
+@@ -106,6 +1052,10 @@ impl MainWindow {
                  if self.gui.is_context_menu_visible() {
                      return;
                  }
@@ -16207,7 +17192,7 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
  
                  // This is needed because some platforms (like macOS)
                  // will fire this event at the same time as WindowEvent::MouseInput,
-@@ -115,12 +1053,11 @@ impl MainWindow {
+@@ -115,12 +1065,11 @@ impl MainWindow {
                  }
  
                  self.mouse_pos = position;
@@ -16224,7 +17209,7 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
              }
              WindowEvent::DroppedFile(file) => {
                  if let Some(content_descriptor) = ContentDescriptor::new_local(&file, None) {
-@@ -132,16 +1069,27 @@ impl MainWindow {
+@@ -132,16 +1081,27 @@ impl MainWindow {
                  }
              }
              WindowEvent::Focused(true) => {
@@ -16254,7 +17239,7 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
                  use ruffle_core::events::MouseButton as RuffleMouseButton;
                  use winit::event::MouseButton;
                  let (x, y) = self.gui.window_to_movie_position(self.mouse_pos);
-@@ -162,12 +1110,14 @@ impl MainWindow {
+@@ -162,12 +1122,14 @@ impl MainWindow {
                      },
                      ElementState::Released => PlayerEvent::MouseUp { x, y, button },
                  };
@@ -16270,7 +17255,7 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
  
                          // MouseUp event will be ignored when the context menu is shown,
                          // but it has to be dispatched when the menu closes.
-@@ -176,9 +1126,10 @@ impl MainWindow {
+@@ -176,9 +1138,10 @@ impl MainWindow {
                              y,
                              button: RuffleMouseButton::Right,
                          };
@@ -16282,7 +17267,7 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
              }
              WindowEvent::MouseWheel { delta, .. } => {
                  if self.gui.is_context_menu_visible() {
-@@ -192,21 +1143,28 @@ impl MainWindow {
+@@ -192,21 +1155,28 @@ impl MainWindow {
                      MouseScrollDelta::PixelDelta(pos) => MouseWheelDelta::Pixels(pos.y),
                  };
                  let event = PlayerEvent::MouseWheel { delta };
@@ -16316,7 +17301,7 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
              }
              WindowEvent::ModifiersChanged(new_modifiers) => {
                  self.modifiers = new_modifiers;
-@@ -231,31 +1189,34 @@ impl MainWindow {
+@@ -231,31 +1201,34 @@ impl MainWindow {
                  let key = winit_input_to_ruffle_key_descriptor(&event);
                  match event.state {
                      ElementState::Pressed => {
@@ -16359,7 +17344,7 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
                  }
                  Ime::Disabled => {}
              },
-@@ -263,6 +1224,152 @@ impl MainWindow {
+@@ -263,6 +1236,148 @@ impl MainWindow {
          }
      }
  
@@ -16389,16 +17374,6 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
 +                    .offer_interpolation_restart(on && mugetsu::render_thread_needs_restart());
 +                #[cfg(windows)]
 +                crate::windows::sync_menu_checks(self.gui.window());
-+            }
-+            Setting::FlashEdges(on) => {
-+                ruffle_render::tessellator::set_flash_aa(on);
-+                mugetsu::save_flash_edges(on);
-+                // The drawing surface is made again for it (and shapes tessellated again).
-+                if let Some(mut player) = self.player.get() {
-+                    let quality = player.quality();
-+                    player.renderer_mut().set_quality(quality);
-+                }
-+                self.gui.window().request_redraw();
 +            }
 +            Setting::Graphics(choice) => {
 +                if (cfg!(windows) || cfg!(target_os = "linux")) && choice != mugetsu::saved_graphics() {
@@ -16439,6 +17414,12 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
 +                    // (A click in the menu: the pause of the thorough way is not seen.)
 +                    let freed = free_memory(&mut player, true);
 +                    tracing::info!(target: "ruffle_aqw_perf", "free memory now: {freed}");
++                    // (Diagnostic: what the allocator holds right after, in full.)
++                    tracing::info!(
++                        target: "ruffle_aqw_perf",
++                        "allocator statistics after it: {}",
++                        crate::memory_split::allocator_json_line()
++                    );
 +                }
 +                self.gui.window().request_redraw();
 +            }
@@ -16512,7 +17493,7 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
      fn on_metadata(&mut self, swf_header: HeaderExt) {
          let height_offset = if self.gui.window().fullscreen().is_some() || self.no_gui {
              0.0
-@@ -352,28 +1459,30 @@ impl MainWindow {
+@@ -352,28 +1467,30 @@ impl MainWindow {
          let viewport_scale_factor = self.gui.window().scale_factor();
          if let Some(mut player) = self.player.get() {
              player.set_viewport_dimensions(ViewportDimensions {
@@ -16552,7 +17533,7 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
                      }
                  }
                  _ => {}
-@@ -385,51 +1494,483 @@ impl MainWindow {
+@@ -385,51 +1502,483 @@ impl MainWindow {
          // We should look at changing our tick to happen somewhere else if we see any behavioural problems.
          if matches!(self.loaded, LoadingState::Loaded) {
              let new_time = Instant::now();
@@ -17059,7 +18040,7 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
              self.gui.window().request_redraw();
          }
      }
-@@ -455,6 +1996,9 @@ macro_rules! enter_runtime {
+@@ -455,6 +2004,9 @@ macro_rules! enter_runtime {
  impl App {
      pub fn new(preferences: GlobalPreferences) -> Result<(Self, EventLoop<RuffleEvent>), Error> {
          let event_loop = EventLoop::with_user_event().build()?;
@@ -17069,7 +18050,7 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
  
          let mut font_database = fontdb::Database::default();
          font_database.load_system_fonts();
-@@ -487,9 +2031,10 @@ impl ApplicationHandler<RuffleEvent> for App {
+@@ -487,9 +2039,10 @@ impl ApplicationHandler<RuffleEvent> for App {
  
          if cause == StartCause::Init {
              let movie_url = self.preferences.cli.movie_url.clone();
@@ -17082,7 +18063,7 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
  
              let no_gui = self.preferences.cli.no_gui;
              let min_window_size = if no_gui {
-@@ -505,7 +2050,7 @@ impl ApplicationHandler<RuffleEvent> for App {
+@@ -505,7 +2058,7 @@ impl ApplicationHandler<RuffleEvent> for App {
              #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
              let mut window_attributes = WindowAttributes::default()
                  .with_visible(false)
@@ -17091,7 +18072,7 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
                  .with_window_icon(Some(icon))
                  .with_min_inner_size(min_window_size);
  
-@@ -587,10 +2132,43 @@ impl ApplicationHandler<RuffleEvent> for App {
+@@ -587,10 +2140,43 @@ impl ApplicationHandler<RuffleEvent> for App {
                  occluded: false,
                  mouse_pos: PhysicalPosition::new(0.0, 0.0),
                  mouse_move_pending: false,
@@ -17135,7 +18116,7 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
              });
          }
      }
-@@ -613,6 +2191,14 @@ impl ApplicationHandler<RuffleEvent> for App {
+@@ -613,6 +2199,14 @@ impl ApplicationHandler<RuffleEvent> for App {
                  }
              }
  
@@ -17150,7 +18131,7 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
              (Some(main_window), RuffleEvent::BrowseAndOpen(options, open_type)) => {
                  let event_loop = main_window.event_loop_proxy.clone();
                  let picker = main_window.gui.file_picker();
-@@ -646,7 +2232,7 @@ impl ApplicationHandler<RuffleEvent> for App {
+@@ -646,7 +2240,7 @@ impl ApplicationHandler<RuffleEvent> for App {
              }
  
              (Some(main_window), RuffleEvent::CloseFile) => {
@@ -17159,7 +18140,7 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
                  main_window.gui.close_movie(&mut main_window.player);
              }
  
-@@ -729,18 +2315,49 @@ impl ApplicationHandler<RuffleEvent> for App {
+@@ -729,18 +2323,49 @@ impl ApplicationHandler<RuffleEvent> for App {
              // only place where we're setting control flow, and events cancel wait.
              // Note: the control flow might be set to `ControlFlow::WaitUntil` with a
              // timestamp in the past! Take that into consideration when changing this code.
@@ -17211,7 +18192,7 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
  
          // Manually stop the tokio runtime: this makes sure that any pending Player-bound futures
          // are properly cancelled and put back on the winit event loop before it closes, preventing
-@@ -748,6 +2365,11 @@ impl ApplicationHandler<RuffleEvent> for App {
+@@ -748,6 +2373,11 @@ impl ApplicationHandler<RuffleEvent> for App {
          if let Some(runtime) = self.runtime.take() {
              runtime.shutdown_timeout(std::time::Duration::from_secs(1));
          }
@@ -17223,7 +18204,7 @@ index a8bcdf4aed0267c6bc5c8f892e6cef3870bb0b50..aadb9bff5af4277f50768f7e4d770742
      }
  }
  
-@@ -756,3 +2378,114 @@ enum LoadingState {
+@@ -756,3 +2386,114 @@ enum LoadingState {
      WaitingForResize,
      Loaded,
  }
@@ -17671,7 +18652,7 @@ index df77233daae7b4b46aca8d7a65938945400f7b44..379c5d541cf52b88f7a769c40221764b
      }
  
 diff --git a/desktop/src/gui/context_menu.rs b/desktop/src/gui/context_menu.rs
-index 851e5710184936cde95132fe499f14604b9ec283..ddeb445c6fb7cea88a233bd6251015784e450165 100644
+index 851e5710184936cde95132fe499f14604b9ec283..148d4c933b35c4a428bd2037c90758952ac77b70 100644
 --- a/desktop/src/gui/context_menu.rs
 +++ b/desktop/src/gui/context_menu.rs
 @@ -1,7 +1,9 @@
@@ -17719,7 +18700,7 @@ index 851e5710184936cde95132fe499f14604b9ec283..ddeb445c6fb7cea88a233bd625101578
          let mut item_clicked = false;
          self.position = self.position.or(egui_ctx.pointer_latest_pos());
  
-@@ -92,6 +104,719 @@ impl ContextMenu {
+@@ -92,6 +104,710 @@ impl ContextMenu {
  
          !should_close
      }
@@ -17882,17 +18863,8 @@ index 851e5710184936cde95132fe499f14604b9ec283..ddeb445c6fb7cea88a233bd625101578
 +    let mut rows = Rows::new(ui, z, id);
 +    let mut done = false;
 +
-+    // The picture.
-+    if let Some(choice) = rows.choice(
-+        ui,
-+        "Edge smoothing",
-+        "Flash-style is lighter on laptops",
-+        &["Flash-style", "MSAA"],
-+        if settings.flash_edges { 0 } else { 1 },
-+    ) {
-+        changes.push(Setting::FlashEdges(choice == 0));
-+        done = true;
-+    }
++    // The picture. (Edge smoothing was a row here, Flash-style or MSAA, until 2.0.0: see
++    // `main`.)
 +    let (options, values) = performance_options();
 +    let current = values
 +        .iter()
@@ -17964,9 +18936,9 @@ index 851e5710184936cde95132fe499f14604b9ec283..ddeb445c6fb7cea88a233bd625101578
 +    rows.divider(ui);
 +    let value = match settings.memory_limit_mb {
 +        0 => "Off".to_owned(),
++        1024 => "1 GB".to_owned(),
++        2048 => "2 GB".to_owned(),
 +        3072 => "3 GB".to_owned(),
-+        4096 => "4 GB".to_owned(),
-+        6144 => "6 GB".to_owned(),
 +        mb => format!("{mb} MB"),
 +    };
 +    if rows.value(ui, "Memory limit", "Mugetsu tries to stay under it", &value)
@@ -18190,33 +19162,33 @@ index 851e5710184936cde95132fe499f14604b9ec283..ddeb445c6fb7cea88a233bd625101578
 +/// Returns the limit in MB picked or typed in this pass (0: none), and whether that is the end
 +/// of it (false for "Custom" itself).
 +///
-+/// The presets were 2, 3 and 4 GB. 2 GB cannot be met in a town on DirectX 12 (2.2-2.35 GB
-+/// held right after a freeing), and nobody could know: Task Manager showed 1 GB there. Hence
-+/// the line with the figure, and 3, 4 and 6 GB.
++/// The limit counts what Task Manager shows (see `mugetsu::task_manager_mb`; the user's
++/// decision of 2026-11-16, with these presets): the line with the figure says the same
++/// number. (While it counted committed memory the presets were 3, 4 and 6 GB.)
 +pub(crate) fn memory_limit_rows(ui: &mut Ui, z: f32, id: &str, current_mb: u32) -> Option<(u32, bool)> {
-+    const OPTIONS: [&str; 5] = ["Off", "3 GB", "4 GB", "6 GB", "Custom"];
++    const OPTIONS: [&str; 5] = ["Off", "1 GB", "2 GB", "3 GB", "Custom"];
 +    /// What "Custom" starts at, until a number is typed.
-+    const FIRST_CUSTOM_MB: u32 = 5000;
++    const FIRST_CUSTOM_MB: u32 = 1500;
 +    info_row(
 +        ui,
 +        z,
 +        &format!(
-+            "Now: {:.1} GB, graphics memory included",
++            "Now: {:.1} GB",
 +            crate::mugetsu::memory_now_mb() as f32 / 1024.0
 +        ),
 +    );
 +    let selected = match current_mb {
 +        0 => 0,
-+        3072 => 1,
-+        4096 => 2,
-+        6144 => 3,
++        1024 => 1,
++        2048 => 2,
++        3072 => 3,
 +        _ => 4,
 +    };
 +    let mut picked = match segmented(ui, z, id, &OPTIONS, selected) {
 +        Some(0) => Some((0, true)),
-+        Some(1) => Some((3072, true)),
-+        Some(2) => Some((4096, true)),
-+        Some(3) => Some((6144, true)),
++        Some(1) => Some((1024, true)),
++        Some(2) => Some((2048, true)),
++        Some(3) => Some((3072, true)),
 +        Some(_) => {
 +            focus_number_row(ui, id);
 +            Some((FIRST_CUSTOM_MB, false))
@@ -18225,7 +19197,7 @@ index 851e5710184936cde95132fe499f14604b9ec283..ddeb445c6fb7cea88a233bd625101578
 +    };
 +    if selected == 4
 +        && let Some(typed) =
-+            number_row(ui, z, id, "Custom (MB)", "Enter to apply", current_mb, 1024..=65536)
++            number_row(ui, z, id, "Custom (MB)", "Enter to apply", current_mb, 512..=65536)
 +    {
 +        picked = Some((typed, true));
 +    }
@@ -20436,7 +21408,7 @@ index 0000000000000000000000000000000000000000..79682da6f01af9a55444e04dd007d3d4
 +    }
 +}
 diff --git a/desktop/src/main.rs b/desktop/src/main.rs
-index 2265dc24c5f157677a510508ecad677f6a08e0d8..c3182e4b9130cd36f5cc9c63c06a20f3cfcf010a 100644
+index 2265dc24c5f157677a510508ecad677f6a08e0d8..d8e56d2bd3c369f02c9fd56458adead249e95a24 100644
 --- a/desktop/src/main.rs
 +++ b/desktop/src/main.rs
 @@ -12,9 +12,13 @@ mod cli;
@@ -20590,7 +21562,7 @@ index 2265dc24c5f157677a510508ecad677f6a08e0d8..c3182e4b9130cd36f5cc9c63c06a20f3
  fn panic_hook(info: &PanicHookInfo) {
      CALLSTACK.with(|callstack| {
          if let Some(callstack) = &*callstack.borrow() {
-@@ -85,73 +161,215 @@ fn panic_hook(info: &PanicHookInfo) {
+@@ -85,73 +161,218 @@ fn panic_hook(info: &PanicHookInfo) {
  
      let message = info.payload_as_str().unwrap_or("panic occurred");
  
@@ -20741,8 +21713,11 @@ index 2265dc24c5f157677a510508ecad677f6a08e0d8..c3182e4b9130cd36f5cc9c63c06a20f3
 +    ruffle_core::frame_interpolation::set_enabled(mugetsu::saved_interpolation());
 +    ruffle_core::set_shape_wait(mugetsu::shape_wait());
 +    ruffle_core::set_forgiving_removal(true);
-+    // Flash-style edge smoothing by default (much faster on laptops; MSAA in the menu).
-+    ruffle_render::tessellator::set_flash_aa(mugetsu::saved_flash_edges().unwrap_or(true));
++    // Flash-style edge smoothing (much lighter on laptops). MSAA was a choice in the menu
++    // until 2.0.0 (the user: not needed any more); an `msaa` file next to the exe still draws
++    // with it, as the way back should an item look wrong. What an earlier version saved
++    // (`mugetsu-edges.txt`) is not read any more.
++    ruffle_render::tessellator::set_flash_aa(!mugetsu::exe_flag("msaa"));
 +    mugetsu::load_show_fps();
 +    mugetsu::load_pacing();
 +    mugetsu::load_performance();
@@ -20857,7 +21832,7 @@ index 2265dc24c5f157677a510508ecad677f6a08e0d8..c3182e4b9130cd36f5cc9c63c06a20f3
  
      #[cfg(feature = "shell-completions")]
      if let Some(shell) = opt.completions {
-@@ -163,6 +381,7 @@ fn main() -> Result<(), Error> {
+@@ -163,6 +384,7 @@ fn main() -> Result<(), Error> {
      let preferences = GlobalPreferences::load(opt)?;
  
      let logs_path = &preferences.cli.cache_directory.join("log");
@@ -20865,7 +21840,7 @@ index 2265dc24c5f157677a510508ecad677f6a08e0d8..c3182e4b9130cd36f5cc9c63c06a20f3
      let log_path = preferences.log_filename_pattern().create_path(logs_path);
      if let Some(parent) = log_path.parent() {
          std::fs::create_dir_all(parent)?;
-@@ -176,11 +395,19 @@ fn main() -> Result<(), Error> {
+@@ -176,11 +398,19 @@ fn main() -> Result<(), Error> {
      let (non_blocking_file, _file_guard) = tracing_appender::non_blocking(File::create(log_path)?);
      let (non_blocking_stdout, _stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
  
@@ -20890,7 +21865,7 @@ index 2265dc24c5f157677a510508ecad677f6a08e0d8..c3182e4b9130cd36f5cc9c63c06a20f3
  
      let subscriber = tracing_subscriber::registry()
          .with(env_filter)
-@@ -195,15 +422,71 @@ fn main() -> Result<(), Error> {
+@@ -195,15 +425,71 @@ fn main() -> Result<(), Error> {
  
      subscriber.init();
  
@@ -20965,10 +21940,10 @@ index 2265dc24c5f157677a510508ecad677f6a08e0d8..c3182e4b9130cd36f5cc9c63c06a20f3
  
 diff --git a/desktop/src/memory_split.rs b/desktop/src/memory_split.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..35bc1506c482096abdcc837c94cebb5ca51e34f1
+index 0000000000000000000000000000000000000000..0fc53a49ba553dde62dfa256f8679daf26aac260
 --- /dev/null
 +++ b/desktop/src/memory_split.rs
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,193 @@
 +//! AQW build (diagnostic): what the process's committed memory is made of, for the perf
 +//! log's memory line.
 +//!
@@ -21021,6 +21996,15 @@ index 0000000000000000000000000000000000000000..35bc1506c482096abdcc837c94cebb5c
 +        libmimalloc_sys::mi_free(text.cast());
 +        Some(json)
 +    }
++}
++
++/// mimalloc's statistics as one line, for the log (after "Free memory now": every count it
++/// keeps, to see where what it holds beyond the live bytes sits: its bins of block sizes,
++/// its pages, what it has purged).
++pub fn allocator_json_line() -> String {
++    allocator_json()
++        .map(|json| json.split_whitespace().collect::<Vec<_>>().join(" "))
++        .unwrap_or_else(|| "none".to_string())
 +}
 +
 +/// Bytes the allocator has committed now, if it says.
@@ -21155,10 +22139,10 @@ index 0000000000000000000000000000000000000000..35bc1506c482096abdcc837c94cebb5c
 +}
 diff --git a/desktop/src/mugetsu.rs b/desktop/src/mugetsu.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..62e7e1737edacfc814e9f10f7c2237bfac02e8cc
+index 0000000000000000000000000000000000000000..b05b99bc623ee6c92802dbbc1993aaac8bdbcae6
 --- /dev/null
 +++ b/desktop/src/mugetsu.rs
-@@ -0,0 +1,1744 @@
+@@ -0,0 +1,1776 @@
 +//! AQW build (Mugetsu): things the release player does on its own, without a launcher:
 +//! the window title, remembering that the Vulkan driver crashed on this PC (so the next start
 +//! uses DirectX 12), the "running on the built-in graphics" tip and the new-version notice.
@@ -21171,7 +22155,7 @@ index 0000000000000000000000000000000000000000..62e7e1737edacfc814e9f10f7c2237bf
 +
 +/// Mugetsu's own version. Keep it equal to `ProductVersion` in desktop/Cargo.toml
 +/// ([package.metadata.winresource]) and to the GitHub release tag (`v1.1.1`).
-+pub const VERSION: &str = "1.7.0";
++pub const VERSION: &str = "2.0.0";
 +
 +const RELEASES_API: &str = "https://api.github.com/repos/mugetsu-aqw/mugetsu/releases/latest";
 +const RELEASES_PAGE: &str = "https://github.com/mugetsu-aqw/mugetsu/releases/latest";
@@ -21448,32 +22432,10 @@ index 0000000000000000000000000000000000000000..62e7e1737edacfc814e9f10f7c2237bf
 +    }
 +}
 +
-+/// Edge smoothing (Mugetsu's settings): "flash" for Flash-style, "msaa" for MSAA; no file means
-+/// the default, which is Flash-style when AQW is played (see `main`).
-+const EDGES_FILE: &str = "mugetsu-edges.txt";
-+
-+pub fn saved_flash_edges() -> Option<bool> {
-+    let text = std::fs::read_to_string(config_dir()?.join(EDGES_FILE)).ok()?;
-+    match text.trim() {
-+        "flash" => Some(true),
-+        "msaa" => Some(false),
-+        _ => None,
-+    }
-+}
-+
-+pub fn save_flash_edges(on: bool) {
-+    let Some(dir) = config_dir() else {
-+        return;
-+    };
-+    let _ = std::fs::create_dir_all(&dir);
-+    let _ = std::fs::write(dir.join(EDGES_FILE), if on { "flash\n" } else { "msaa\n" });
-+}
-+
 +/// A choice in Mugetsu's settings, in the game's right-click menu.
 +#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 +pub enum Setting {
 +    Interpolation(bool),
-+    FlashEdges(bool),
 +    /// A graphics API picked in a menu: asked about first (see `gui::prompt`).
 +    Graphics(Option<Graphics>),
 +    /// The same, confirmed: saved, and Mugetsu starts again after closing normally.
@@ -21631,7 +22593,6 @@ index 0000000000000000000000000000000000000000..62e7e1737edacfc814e9f10f7c2237bf
 +#[derive(Clone, Copy, Debug)]
 +pub struct MenuSettings {
 +    pub interpolation: bool,
-+    pub flash_edges: bool,
 +    pub graphics: Option<Graphics>,
 +    /// Whether the graphics choice applies (Windows and Linux, playing AQW).
 +    pub graphics_choice: bool,
@@ -21647,7 +22608,6 @@ index 0000000000000000000000000000000000000000..62e7e1737edacfc814e9f10f7c2237bf
 +    pub fn now() -> Self {
 +        Self {
 +            interpolation: ruffle_core::frame_interpolation::enabled(),
-+            flash_edges: ruffle_render::tessellator::flash_aa_switch(),
 +            graphics: saved_graphics(),
 +            graphics_choice: (cfg!(windows) || cfg!(target_os = "linux")) && plays_aqw(),
 +            show_fps: show_fps(),
@@ -21710,12 +22670,12 @@ index 0000000000000000000000000000000000000000..62e7e1737edacfc814e9f10f7c2237bf
 +/// memory (everything the system has promised it, which on Windows includes the backing of
 +/// its graphics memory: 2,500 MB against a working set of 1,100 in a town on DirectX 12).
 +///
-+/// The memory limit counts the committed memory. Freeing moves it by 250-900 MB and the
-+/// working set by about 100 (measured 2026-11-15), so a limit on Task Manager's figure would
-+/// have next to nothing to work with; and on built-in graphics the graphics memory is the
-+/// PC's RAM. Because Task Manager shows less, the menu says what the figure is now
-+/// (`memory_now_mb`): a limit under it cannot be met (the first limit the user set, 2 GB
-+/// against the 1 GB Task Manager showed, freed every 20 seconds for a whole session).
++/// The memory limit counted the committed memory at first (freeing moves it by 250-900 MB
++/// and the working set by about 100, measured 2026-11-15). The user's decision of
++/// 2026-11-16: it counts what Task Manager shows (`task_manager_mb`), so that the limit, the
++/// menu's "Now:" line and the number people look at are the same one, with presets of 1, 2
++/// and 3 GB. What brings that figure down in a long session is the freeing of unused movie
++/// libraries (core's `Library::sweep_movie_libraries`), not this limit's own freeing.
 +pub fn process_memory_mb() -> (u64, u64) {
 +    let mut working_set = 0usize;
 +    let mut commit = 0usize;
@@ -21728,6 +22688,56 @@ index 0000000000000000000000000000000000000000..62e7e1737edacfc814e9f10f7c2237bf
 +    ((working_set as u64) >> 20, (commit as u64) >> 20)
 +}
 +
++/// The figure Task Manager's "Memory" column shows for the process, in MB: on Windows its
++/// private working set (the RAM it holds that no other process shares), from the system; where
++/// that cannot be read (Windows before 10 22H2, other systems) the whole working set, which
++/// is a little more.
++pub fn task_manager_mb() -> u64 {
++    #[cfg(windows)]
++    {
++        // `PROCESS_MEMORY_COUNTERS_EX2` (psapi.h): the last two fields are what EX2 adds.
++        #[repr(C)]
++        #[derive(Default)]
++        struct Counters {
++            cb: u32,
++            page_fault_count: u32,
++            peak_working_set_size: usize,
++            working_set_size: usize,
++            quota_peak_paged_pool_usage: usize,
++            quota_paged_pool_usage: usize,
++            quota_peak_non_paged_pool_usage: usize,
++            quota_non_paged_pool_usage: usize,
++            pagefile_usage: usize,
++            peak_pagefile_usage: usize,
++            private_usage: usize,
++            private_working_set_size: usize,
++            shared_commit_usage: u64,
++        }
++        #[link(name = "kernel32")]
++        unsafe extern "system" {
++            fn K32GetProcessMemoryInfo(
++                process: *mut std::ffi::c_void,
++                counters: *mut Counters,
++                cb: u32,
++            ) -> i32;
++            fn GetCurrentProcess() -> *mut std::ffi::c_void;
++        }
++        let mut counters = Counters {
++            cb: size_of::<Counters>() as u32,
++            ..Default::default()
++        };
++        // SAFETY: `counters` is a valid, writable structure of the size given; the handle is
++        // the pseudo-handle of this process.
++        let read = unsafe {
++            K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) != 0
++        };
++        if read && counters.private_working_set_size > 0 {
++            return (counters.private_working_set_size as u64) >> 20;
++        }
++    }
++    process_memory_mb().0
++}
++
 +/// What the memory limit is compared with right now, in MB, for the menu (which is drawn up
 +/// to a thousand times a second: read once a second at the most).
 +pub fn memory_now_mb() -> u64 {
@@ -21736,7 +22746,7 @@ index 0000000000000000000000000000000000000000..62e7e1737edacfc814e9f10f7c2237bf
 +    match *last {
 +        Some((at, mb)) if at.elapsed() < std::time::Duration::from_secs(1) => mb,
 +        _ => {
-+            let mb = process_memory_mb().1;
++            let mb = task_manager_mb();
 +            *last = Some((std::time::Instant::now(), mb));
 +            mb
 +        }
@@ -22138,7 +23148,7 @@ index 0000000000000000000000000000000000000000..62e7e1737edacfc814e9f10f7c2237bf
 +/// unless their `no-...` file or `safe-drawing` is next to the exe. The code that reads each
 +/// variable still has it off unless it is set, so a movie on the command line and the tests
 +/// run without them unless they ask.
-+const DEFAULT_ON: [(&str, &str, &str); 7] = [
++const DEFAULT_ON: [(&str, &str, &str); 8] = [
 +    // The per-frame walks skip the branches with nothing to do: frame construction and frame
 +    // scripts, and `enter_frame`.
 +    ("lean-scripts", "RUFFLE_LEAN_SCRIPTS", "no-lean-scripts"),
@@ -22156,6 +23166,11 @@ index 0000000000000000000000000000000000000000..62e7e1737edacfc814e9f10f7c2237bf
 +    // aura icons while they cool down) get a copy at the window's scale and are shown from
 +    // it (see core's `bitmap_data::Sharp`). About 4 small draws a second in a fight.
 +    ("sharp-snapshots", "RUFFLE_SHARP_SNAPSHOTS", "no-sharp-snapshots"),
++    // Not a speed-up either: clips the game puts on the stage between two frames run their
++    // first frame scripts before the next picture, not in the next frame (see core's
++    // `frame_lifecycle::early_scripts`). Without it colour-custom armour, hair, capes and
++    // helms show in the colours they were drawn in for a moment.
++    ("early-scripts", "RUFFLE_EARLY_SCRIPTS", "no-early-scripts"),
 +];
 +
 +/// Pictures recorded on a render thread: ON with frame interpolation (as saved when Mugetsu
@@ -22177,8 +23192,8 @@ index 0000000000000000000000000000000000000000..62e7e1737edacfc814e9f10f7c2237bf
 +    ("slow-multiply", "RUFFLE_SLOW_MULTIPLY"),
 +    // (No `lean-pools` file: replacing Vulkan's command pools lost the graphics device on
 +    // 2026-11-14. `RUFFLE_LEAN_POOLS` is still read by the renderer, for experiments only.)
-+    // Flash-style edge smoothing (from the days it was a prototype; it is the default now,
-+    // see `saved_flash_edges`).
++    // Flash-style edge smoothing (from the days it was a prototype; it is what AQW is drawn
++    // with now, see `main`).
 +    ("flash-aa", "RUFFLE_FLASH_AA"),
 +    // The lean walks' check: everything is still walked, and what the lean walks would have
 +    // skipped wrongly is reported in the log ("LEAN VERIFY", and the "lean walks" line).
@@ -22786,7 +23801,7 @@ index 0000000000000000000000000000000000000000..62e7e1737edacfc814e9f10f7c2237bf
 +        assert!(parse_version("v1.0.10") > parse_version("1.0.9"));
 +    }
 +
-+    const NEW: [&str; 7] = [
++    const NEW: [&str; 8] = [
 +        "RUFFLE_LEAN_SCRIPTS",
 +        "RUFFLE_LEAN_FRAMES",
 +        "RUFFLE_LEAN_RENDER",
@@ -22794,6 +23809,7 @@ index 0000000000000000000000000000000000000000..62e7e1737edacfc814e9f10f7c2237bf
 +        "RUFFLE_SHAPE_UPLOADS",
 +        "RUFFLE_PICK_BOUNDS",
 +        "RUFFLE_SHARP_SNAPSHOTS",
++        "RUFFLE_EARLY_SCRIPTS",
 +    ];
 +
 +    const THREAD: &str = super::RENDER_THREAD;
