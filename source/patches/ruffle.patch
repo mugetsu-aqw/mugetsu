@@ -183,10 +183,10 @@ index 739529ee3e6ec1d2abca7007382521d7771cefd7..44a79278bd64c505dc0c9926ef4bc42f
  impl<'gc> Deref for SwfMovie<'gc> {
 diff --git a/core/src/aqw_bench.rs b/core/src/aqw_bench.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..1a9b32deb54232ed66e97ba3115514a22a6aeda3
+index 0000000000000000000000000000000000000000..932f1ab8e198020973c2ed075ea21002adca9d3b
 --- /dev/null
 +++ b/core/src/aqw_bench.rs
-@@ -0,0 +1,702 @@
+@@ -0,0 +1,707 @@
 +//! AQW build: an offline load benchmark (a test, run on demand).
 +//!
 +//! Loads real AQW files from `AQW_CORPUS` (a folder, searched for .swf files) into one player
@@ -567,7 +567,9 @@ index 0000000000000000000000000000000000000000..1a9b32deb54232ed66e97ba3115514a2
 +    ];
 +    let mut bytes = Vec::new();
 +    swf::write_swf(&header, &tags, &mut bytes).expect("root movie");
-+    SwfMovieData::from_data(&bytes, "file:///aqw_bench.swf".to_string(), None, None).expect("root")
++    // (`AQW_ROOT_URL`: another address for the root movie; see `aqw_early_scripts`.)
++    let url = std::env::var("AQW_ROOT_URL").unwrap_or_else(|_| "file:///aqw_bench.swf".to_string());
++    SwfMovieData::from_data(&bytes, url, None, None).expect("root")
 +}
 +
 +#[test]
@@ -778,7 +780,10 @@ index 0000000000000000000000000000000000000000..1a9b32deb54232ed66e97ba3115514a2
 +/// load throttle's timer fires; then a picture is drawn, then a frame runs. Prints how many
 +/// frame scripts had run at each point and how many clips the picture drew with their script
 +/// still waiting (those are the ones seen in the colours they were drawn in). Run it once as
-+/// it is and once with `RUFFLE_EARLY_SCRIPTS=1`.
++/// it is and once with `RUFFLE_EARLY_SCRIPTS=1`. Early scripts are only for the players' gear
++/// files, told by their address: what `loadBytes` loads has the address of the movie that
++/// loaded it, so `AQW_ROOT_URL` gives the test's root movie an address (one under
++/// `/gamefiles/classes/` for a part that is to count as gear; without it, it does not).
 +#[test]
 +#[ignore]
 +fn aqw_early_scripts() {
@@ -8062,7 +8067,7 @@ index 8972325e2e8b14204a1683fae046903f067f36bd..527742cd1de7718b6f2a57ae3c0d87a0
 +    }
  }
 diff --git a/core/src/display_object/movie_clip.rs b/core/src/display_object/movie_clip.rs
-index 828033cd60d0d49980dacf07c80235787d152cb6..affc2ed28b49521971f63c20dd8358acaf6aaae6 100644
+index 828033cd60d0d49980dacf07c80235787d152cb6..1914326a73c4f585db97f85c6fcef5307f06f9e6 100644
 --- a/core/src/display_object/movie_clip.rs
 +++ b/core/src/display_object/movie_clip.rs
 @@ -24,7 +24,7 @@ use crate::display_object::interactive::{
@@ -8360,10 +8365,17 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..affc2ed28b49521971f63c20dd8358ac
      }
  
      /// Resolve the AVM1 `hitArea` property for mouse picking, if set.
-@@ -2459,7 +2619,10 @@ impl<'gc> MovieClip<'gc> {
+@@ -2458,8 +2618,16 @@ impl<'gc> MovieClip<'gc> {
+             if !self.is_executing_avm2_frame_script() {
                  let is_fresh_frame = self.last_queued_script_frame() != Some(frame_id);
  
-                 if is_fresh_frame && let Some(callable) = self.frame_script(frame_id) {
+-                if is_fresh_frame && let Some(callable) = self.frame_script(frame_id) {
++                // (AQW build: between frames only the players' gear runs its waiting
++                // scripts; see `frame_lifecycle::early_scripts`.)
++                if is_fresh_frame
++                    && crate::frame_lifecycle::early_scripts::may_run(self.movie().url())
++                    && let Some(callable) = self.frame_script(frame_id)
++                {
 +                    settle::work();
 +                    crate::frame_lifecycle::early_scripts::script();
                      let callable = Avm2Value::from(callable);
@@ -8371,7 +8383,7 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..affc2ed28b49521971f63c20dd8358ac
  
                      self.set_last_queued_script_frame(Some(frame_id));
                      self.set_has_pending_script(false);
-@@ -2486,6 +2649,11 @@ impl<'gc> MovieClip<'gc> {
+@@ -2486,6 +2654,11 @@ impl<'gc> MovieClip<'gc> {
                              e,
                              "Error running AVM2 frame script",
                          );
@@ -8383,7 +8395,7 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..affc2ed28b49521971f63c20dd8358ac
                      }
  
                      self.0
-@@ -2496,6 +2664,7 @@ impl<'gc> MovieClip<'gc> {
+@@ -2496,6 +2669,7 @@ impl<'gc> MovieClip<'gc> {
  
          let goto_info = self.0.queued_goto.take();
          if let Some(goto_info) = goto_info {
@@ -8391,7 +8403,7 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..affc2ed28b49521971f63c20dd8358ac
              self.goto_frame_now(context, goto_info);
  
              // In SWFv10+, the `goto_frame_now` above will trigger an inner goto
-@@ -2512,24 +2681,90 @@ impl<'gc> MovieClip<'gc> {
+@@ -2512,24 +2686,90 @@ impl<'gc> MovieClip<'gc> {
  
      fn check_has_pending_script(self) {
          let has_pending_script = self.has_frame_script(self.0.current_frame.get());
@@ -8491,7 +8503,7 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..affc2ed28b49521971f63c20dd8358ac
          let skip_frame = self.base().should_skip_next_enter_frame();
          //Child removals from looping gotos appear to resolve in reverse order.
          for child in self.iter_render_list().rev() {
-@@ -2558,6 +2793,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
+@@ -2558,6 +2798,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
              let is_playing = self.playing();
  
              if is_playing {
@@ -8499,7 +8511,7 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..affc2ed28b49521971f63c20dd8358ac
                  self.run_frame_internal(context, true, true, true);
              }
  
-@@ -2568,6 +2804,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
+@@ -2568,6 +2809,7 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
              let place_actions = self.unqueue_filtered(|q| q.unqueue_add());
  
              for (_, tag) in place_actions {
@@ -8507,7 +8519,7 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..affc2ed28b49521971f63c20dd8358ac
                  let mut reader = data.read_from(tag.tag_start);
                  let version = match tag.tag_type {
                      QueuedTagAction::Place(v) => v,
-@@ -2581,8 +2818,9 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
+@@ -2581,8 +2823,9 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
          }
      }
  
@@ -8519,7 +8531,7 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..affc2ed28b49521971f63c20dd8358ac
          // AVM1 code expects to execute in line with timeline instructions, so
          // it's exempted from frame construction.
          if self.movie().is_action_script_3()
-@@ -2590,12 +2828,16 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
+@@ -2590,12 +2833,16 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
          {
              let is_load_frame = !self.0.initialized();
              let needs_construction = if self.0.object2.get().is_none() {
@@ -8536,7 +8548,7 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..affc2ed28b49521971f63c20dd8358ac
              self.0.unset_loop_queued();
  
              if needs_construction {
-@@ -2645,18 +2887,122 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
+@@ -2645,18 +2892,123 @@ impl<'gc> TDisplayObject<'gc> for MovieClip<'gc> {
              self.check_has_pending_script();
          }
      }
@@ -8645,6 +8657,7 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..affc2ed28b49521971f63c20dd8358ac
 +            let frame_id = self.0.queued_script_frame.get();
 +            if self.last_queued_script_frame() != Some(frame_id)
 +                && self.frame_script(frame_id).is_some()
++                && crate::frame_lifecycle::early_scripts::applies_to(self.movie().url())
 +                && crate::frame_lifecycle::early_scripts::drawn_waiting()
 +            {
 +                self.log_drawn_waiting();
@@ -8659,7 +8672,7 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..affc2ed28b49521971f63c20dd8358ac
          }
          self.render_children(context);
      }
-@@ -2866,6 +3212,13 @@ impl<'gc> TDisplayObjectContainer<'gc> for MovieClip<'gc> {
+@@ -2866,6 +3218,13 @@ impl<'gc> TDisplayObjectContainer<'gc> for MovieClip<'gc> {
      }
  
      fn raw_container_mut(&self, mc: &Mutation<'gc>) -> RefMut<'_, ChildContainer<'gc>> {
@@ -8673,7 +8686,7 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..affc2ed28b49521971f63c20dd8358ac
          let write = unlock!(Gc::write(mc, self.0), MovieClipData, cell);
          RefMut::map(write.borrow_mut(), |r| &mut r.container)
      }
-@@ -3182,6 +3535,11 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
+@@ -3182,6 +3541,11 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
                  .rev()
                  .filter(|child| child.as_interactive().is_none());
  
@@ -8685,7 +8698,7 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..affc2ed28b49521971f63c20dd8358ac
              for child in interactive.into_iter().chain(non_interactive) {
                  // Mask children are not clickable
                  if child.clip_depth() > 0 || child.maskee().is_some() {
-@@ -3190,7 +3548,28 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
+@@ -3190,7 +3554,28 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
  
                  let mut res = if let Some(child) = child.as_interactive() {
                      if child.as_displayobject().movie().is_action_script_3() {
@@ -8715,7 +8728,7 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..affc2ed28b49521971f63c20dd8358ac
                      } else {
                          let avm1_result =
                              child.mouse_pick_avm1(context, point, require_button_mode);
-@@ -3252,8 +3631,10 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
+@@ -3252,8 +3637,10 @@ impl<'gc> TInteractiveObject<'gc> for MovieClip<'gc> {
              }
  
              // Check drawing, because this selects the current clip, it must have mouse enabled
@@ -8728,7 +8741,7 @@ index 828033cd60d0d49980dacf07c80235787d152cb6..affc2ed28b49521971f63c20dd8358ac
                  && drawing.hit_test(local_matrix * point, &local_matrix)
              {
                  return if self.mouse_enabled() {
-@@ -3542,7 +3923,11 @@ impl<'gc, 'a> MovieClipShared<'gc> {
+@@ -3542,7 +3929,11 @@ impl<'gc, 'a> MovieClipShared<'gc> {
          reader: &mut SwfStream<'a>,
          version: u8,
      ) -> Result<(), Error> {
@@ -11656,7 +11669,7 @@ index 26d9d14348fb3172250662291b926901613bce3a..e4ad322d0ccdbfea6497fcc9d7e47bb3
              return;
          };
 diff --git a/core/src/frame_lifecycle.rs b/core/src/frame_lifecycle.rs
-index 91bdb52df526dbb0dbbcad9d1c179667ff629fce..0aea5c766e2f799ad8cdca44d6f26182b279f538 100644
+index 91bdb52df526dbb0dbbcad9d1c179667ff629fce..3e009dfbb8d54310b588e201b7e0fdbac284dc80 100644
 --- a/core/src/frame_lifecycle.rs
 +++ b/core/src/frame_lifecycle.rs
 @@ -72,6 +72,8 @@ pub enum FramePhase {
@@ -11687,7 +11700,7 @@ index 91bdb52df526dbb0dbbcad9d1c179667ff629fce..0aea5c766e2f799ad8cdca44d6f26182
  
          return;
      }
-@@ -206,6 +213,192 @@ fn run_frame_script_cleanup<'gc>(context: &mut UpdateContext<'gc>) {
+@@ -206,6 +213,241 @@ fn run_frame_script_cleanup<'gc>(context: &mut UpdateContext<'gc>) {
      }
  }
  
@@ -11719,6 +11732,16 @@ index 91bdb52df526dbb0dbbcad9d1c179667ff629fce..0aea5c766e2f799ad8cdca44d6f26182
 +/// `RUFFLE_EARLY_SCRIPTS` is set: the desktop player sets it when AQW is played (a
 +/// `no-early-scripts` file next to the exe, or `safe-drawing`, leaves it off), and the tests
 +/// and other movies run in Flash's order.
++///
++/// AND ONLY FOR THE PLAYERS' GEAR (`gear_file`: the game's `items/`, `classes/` and `hair/`
++/// folders). 2.0.0 ran every waiting script early, and that order broke the game's own
++/// screens: a script of a clip in a room or in the interface can build its text from what
++/// its parent's next frame script, or an `enterFrame` listener, sets first. In /spellcraft
++/// every ink read "Requires No Rank", and target portraits showed 0 for HP and mana (reports
++/// of 2026-11-17; neither happened before 2.0.0). The gear's scripts ask their avatar for a
++/// colour and nothing else, and it is their clips that were seen in the wrong colours. A
++/// script that may not run early stays waiting and runs in its frame, as in Flash.
++/// (`RUFFLE_EARLY_SCRIPTS=all` is 2.0.0's way, for comparisons.)
 +pub mod early_scripts {
 +    use std::cell::Cell;
 +
@@ -11762,6 +11785,33 @@ index 91bdb52df526dbb0dbbcad9d1c179667ff629fce..0aea5c766e2f799ad8cdca44d6f26182
 +    pub fn enabled() -> bool {
 +        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 +        *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_EARLY_SCRIPTS").is_some())
++    }
++
++    /// `RUFFLE_EARLY_SCRIPTS=all`: every movie's waiting scripts run early, as in 2.0.0.
++    fn everywhere() -> bool {
++        static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        *ALL.get_or_init(|| std::env::var("RUFFLE_EARLY_SCRIPTS").is_ok_and(|value| value == "all"))
++    }
++
++    /// Whether a movie is one of the players' gear files: armour and class art, items
++    /// (helms, capes, weapons, pets, ground items) and hair.
++    pub fn gear_file(url: &str) -> bool {
++        ["/gamefiles/items/", "/gamefiles/classes/", "/gamefiles/hair/"]
++            .iter()
++            .any(|folder| url.contains(folder))
++    }
++
++    /// Whether the scripts of a movie's clips are among those run early (and, for the log,
++    /// among those watched for being drawn before they ran).
++    pub fn applies_to(url: &str) -> bool {
++        everywhere() || gear_file(url)
++    }
++
++    /// Whether a waiting frame script of a clip of this movie may run now: always in a
++    /// frame's own script phase; in `run`, only if early scripts apply to its movie.
++    #[inline]
++    pub fn may_run(url: &str) -> bool {
++        !RUNNING.get() || applies_to(url)
 +    }
 +
 +    /// A display object was given a parent, or a clip a script for the frame it is on. In
@@ -11858,7 +11908,19 @@ index 91bdb52df526dbb0dbbcad9d1c179667ff629fce..0aea5c766e2f799ad8cdca44d6f26182
 +            walks += 1;
 +            *context.frame_phase = FramePhase::FrameScripts;
 +            crate::display_object::TDisplayObject::run_frame_scripts(stage, context);
-+            super::run_frame_script_cleanup(context);
++            // (The clips that registered a script for their frame during a nested frame's
++            // script phase, as `run_frame_script_cleanup` runs them: those that may not run
++            // early go back in the queue for the frame.)
++            let queued: Vec<_> = context.frame_script_cleanup_queue.drain(..).collect();
++            for clip in queued {
++                if applies_to(crate::display_object::TDisplayObject::movie(clip).url()) {
++                    clip.set_has_pending_script(true);
++                    clip.set_last_queued_script_frame(None);
++                    clip.run_local_frame_scripts(context);
++                } else {
++                    context.frame_script_cleanup_queue.push_back(clip);
++                }
++            }
 +            *context.frame_phase = FramePhase::Idle;
 +            if !PARENTED.replace(false) {
 +                break;
@@ -11880,6 +11942,37 @@ index 91bdb52df526dbb0dbbcad9d1c179667ff629fce..0aea5c766e2f799ad8cdca44d6f26182
  /// Run all previously-executed frame phases on a newly-constructed display
  /// object.
  ///
+@@ -228,3 +470,30 @@ pub fn catchup_display_object_to_frame<'gc>(
+         }
+     }
+ }
++
++#[cfg(test)]
++mod early_scripts_tests {
++    use super::early_scripts::gear_file;
++
++    #[test]
++    fn the_players_gear_is_told_by_its_folder() {
++        for url in [
++            "https://game.aq.com/game/gamefiles/classes/M/SomeArmor.swf?v=5.32",
++            "https://game.aq.com/game/gamefiles/items/helms/SomeHelm.swf?v=5.32",
++            "https://game.aq.com/game/gamefiles/items/capes/SomeCape.swf",
++            "https://game.aq.com/game/gamefiles/hair/F/SomeHair.swf?v=5.32",
++        ] {
++            assert!(gear_file(url), "{url}");
++        }
++        for url in [
++            "https://game.aq.com/game/gamefiles/Game4000r8.swf?ver=R0048",
++            "https://game.aq.com/game/gamefiles/maps/tradeskills/spellcraft/game-spellcraftr2.swf?v=5.32",
++            "https://game.aq.com/game/gamefiles/interface/Assets/Assets_20261016r2.swf?v=5.32",
++            "https://game.aq.com/game/gamefiles/mon/SomeMonster.swf",
++            "https://game.aq.com/game/gamefiles/title/Generic2.swf",
++            "file:///test.swf",
++        ] {
++            assert!(!gear_file(url), "{url}");
++        }
++    }
++}
 diff --git a/core/src/html/layout.rs b/core/src/html/layout.rs
 index 367e4ad9cfa3cd7f3c62fa408a5f1e95494211f2..98bdcd2cc1f0089db338f3cefd4c890b18e6492d 100644
 --- a/core/src/html/layout.rs
@@ -14378,7 +14471,7 @@ index cacd85384de3de95e416350798fb2abdb20bd8b8..52efdaba9c917112d847837072894699
 +    }
 +}
 diff --git a/desktop/Cargo.toml b/desktop/Cargo.toml
-index e9a8c49aa8a8e6f5ae6eeec3c098146b798a1bca..08139a297a73ba015af2d6cdeb8e932e9f318fb8 100644
+index e9a8c49aa8a8e6f5ae6eeec3c098146b798a1bca..c9958c3a8e8c1a1ebcdc777d4b6f11ab9f9f5363 100644
 --- a/desktop/Cargo.toml
 +++ b/desktop/Cargo.toml
 @@ -12,6 +12,12 @@ workspace = true
@@ -14430,8 +14523,8 @@ index e9a8c49aa8a8e6f5ae6eeec3c098146b798a1bca..08139a297a73ba015af2d6cdeb8e932e
 +CompanyName = "Mugetsu"
 +LegalCopyright = "Mugetsu; based on Ruffle, Copyright © 2018 Ruffle LLC and Ruffle contributors"
 +# Keep equal to `mugetsu::VERSION` (desktop/src/mugetsu.rs).
-+ProductVersion = "2.0.0"
-+FileVersion = "2.0.0 (Ruffle 0.8.0-nightly.2026.11.10)"
++ProductVersion = "2.0.1"
++FileVersion = "2.0.1 (Ruffle 0.8.0-nightly.2026.11.10)"
  # InternalName should be the same as the module name
  InternalName = "ruffle_desktop"
 -OriginalFilename = "ruffle.exe"
@@ -22139,7 +22232,7 @@ index 0000000000000000000000000000000000000000..0fc53a49ba553dde62dfa256f8679daf
 +}
 diff --git a/desktop/src/mugetsu.rs b/desktop/src/mugetsu.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..b05b99bc623ee6c92802dbbc1993aaac8bdbcae6
+index 0000000000000000000000000000000000000000..557a8a773fcccfce9be77f66864faba47a4666bf
 --- /dev/null
 +++ b/desktop/src/mugetsu.rs
 @@ -0,0 +1,1776 @@
@@ -22155,7 +22248,7 @@ index 0000000000000000000000000000000000000000..b05b99bc623ee6c92802dbbc1993aaac
 +
 +/// Mugetsu's own version. Keep it equal to `ProductVersion` in desktop/Cargo.toml
 +/// ([package.metadata.winresource]) and to the GitHub release tag (`v1.1.1`).
-+pub const VERSION: &str = "2.0.0";
++pub const VERSION: &str = "2.0.1";
 +
 +const RELEASES_API: &str = "https://api.github.com/repos/mugetsu-aqw/mugetsu/releases/latest";
 +const RELEASES_PAGE: &str = "https://github.com/mugetsu-aqw/mugetsu/releases/latest";
@@ -23166,10 +23259,10 @@ index 0000000000000000000000000000000000000000..b05b99bc623ee6c92802dbbc1993aaac
 +    // aura icons while they cool down) get a copy at the window's scale and are shown from
 +    // it (see core's `bitmap_data::Sharp`). About 4 small draws a second in a fight.
 +    ("sharp-snapshots", "RUFFLE_SHARP_SNAPSHOTS", "no-sharp-snapshots"),
-+    // Not a speed-up either: clips the game puts on the stage between two frames run their
-+    // first frame scripts before the next picture, not in the next frame (see core's
-+    // `frame_lifecycle::early_scripts`). Without it colour-custom armour, hair, capes and
-+    // helms show in the colours they were drawn in for a moment.
++    // Not a speed-up either: clips of the players' gear that the game puts on the stage
++    // between two frames run their first frame scripts before the next picture, not in the
++    // next frame (see core's `frame_lifecycle::early_scripts`). Without it colour-custom
++    // armour, hair, capes and helms show in the colours they were drawn in for a moment.
 +    ("early-scripts", "RUFFLE_EARLY_SCRIPTS", "no-early-scripts"),
 +];
 +
