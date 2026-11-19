@@ -94,7 +94,7 @@ pixels and stretches the picture over the window, a little softer and faster.
 - **Open source.** All of Mugetsu's code is public in the [`source`](source) folder (GPL-3.0), and from version
   1.3.1 on, every release is built from it by GitHub Actions: each build's page shows its log and the SHA-256 of
   the zip it made.
-- **VirusTotal (version 2.0.1):** [zip 0/67](https://www.virustotal.com/gui/file/72e8f35e6ffbacdf7922f939f6c3250eada96364389861b825fd4681b25fe831) · [Mugetsu.exe 0/71](https://www.virustotal.com/gui/file/42bf54960efd6b146e319efb04addca9a6b9d619dfe71116a10898f45715f273) · [Linux archive 0/62](https://www.virustotal.com/gui/file/c59906b254cf5bf0bf369ba07bdb264c85ebacb9d1a1ca456db76db32a44f2ba) · [macOS zip 0/64](https://www.virustotal.com/gui/file/5320aac36b4264c049e9c9aa0c1b4ac5b435cf275c4cd9c2e50b151b5ca15f7d)
+- **VirusTotal (version 2.0.2):** [zip 0/66](https://www.virustotal.com/gui/file/7d7324554d2f71309c910b142318d8d1b49625c3375bbba1381c82ce93a1ebb4) · [Mugetsu.exe 0/71](https://www.virustotal.com/gui/file/0bbee6254f7447599fc6636ebe29d4279dfa6b0b33175a14d28e53203ac265d5) · [Linux archive 0/62](https://www.virustotal.com/gui/file/3541329ecae63edf588d8b7164e6592a0fd969fc393de6c68a2754cc77faab18) · [macOS zip 0/64](https://www.virustotal.com/gui/file/2a60ea386913458ab8465bac2a65dafed371e27018c950ccf1d1c414407259be)
 - **SHA-256** of each release file is listed on its release page, so you can check your download.
 
 ## FAQ
