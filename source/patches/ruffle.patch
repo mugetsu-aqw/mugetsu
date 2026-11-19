@@ -3234,10 +3234,10 @@ index 91557eaff7a20ca2b10477c3d8f74e8a6dddd788..f7a82ee0639c59b5c92fffe4d7d36d62
              .map(|(name, ns, prop)| (name.as_wstr().to_utf8_lossy(), ns, *prop))
              .collect();
 diff --git a/core/src/display_object.rs b/core/src/display_object.rs
-index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e57418a4a1 100644
+index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf17e41d1e 100644
 --- a/core/src/display_object.rs
 +++ b/core/src/display_object.rs
-@@ -32,11 +32,14 @@ mod avm2_button;
+@@ -32,11 +32,15 @@ mod avm2_button;
  mod bitmap;
  mod container;
  mod edit_text;
@@ -3250,10 +3250,11 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
  mod morph_shape;
  mod movie_clip;
 +pub mod pick_notes;
++pub mod self_check;
  mod stage;
  mod text;
  mod text_line;
-@@ -112,6 +115,14 @@ pub struct BitmapCache {
+@@ -112,6 +116,29 @@ pub struct BitmapCache {
  
      /// Whether we warned that this bitmap was too large to be cached
      warned_for_oversize: bool,
@@ -3265,10 +3266,25 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
 +    /// AQW build: the SWF frame the contents last changed in. With frame interpolation the
 +    /// contents move between frames, so the cache is redrawn on every draw of that frame.
 +    aqw_changed_frame: u64,
++
++    /// AQW build: the SWF frame of the last draw of a picture that is in between two frames,
++    /// 0 if the last draw wasn't one: its filters, or something in its contents (a transform,
++    /// filters, a tween's ratio, those of the cached objects in them included), were drawn
++    /// blended part of the way from the previous frame's (see `interp::note_blend`). In that
++    /// frame its contents move: it's drawn in every picture. In a later frame it's drawn once
++    /// more, where they've got to: the frame's last picture isn't at the end of the way (at
++    /// 0.8 of it, the contents rested a fifth of their last step short), and a change made
++    /// after it is first drawn, blended, in the next frame's pictures (after a timer moved a
++    /// child at the end of a frame, the picture kept it a whole step short).
++    aqw_moved_frame: u64,
++
++    /// AQW build: what the picture was drawn from, for `RUFFLE_CACHE_VERIFY` (see
++    /// `self_check`; empty without it).
++    aqw_verify: self_check::Slot,
  }
  
  impl BitmapCache {
-@@ -121,6 +132,7 @@ impl BitmapCache {
+@@ -121,6 +148,7 @@ impl BitmapCache {
          // Setting the old transform to something invalid is a cheap way of making it invalid,
          // without reserving an extra field for.
          self.matrix_a = f32::NAN;
@@ -3276,7 +3292,73 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
      }
  
      fn is_dirty(&self, other: &Matrix, source_width: u32, source_height: u32) -> bool {
-@@ -318,6 +330,18 @@ pub struct DisplayObjectBase<'gc> {
+@@ -159,12 +187,7 @@ impl BitmapCache {
+         {
+             return; // No need to resize it
+         }
+-        let acceptable_size = if swf_version > 9 {
+-            let total = actual_width * actual_height;
+-            actual_width < 8191 && actual_height < 8191 && total < 16777215
+-        } else {
+-            actual_width < 2880 && actual_height < 2880
+-        };
++        let acceptable_size = cache_size_acceptable(actual_width, actual_height, swf_version);
+ 
+         if renderer.is_offscreen_supported()
+             && let Some(actual_width) = NonZero::new(actual_width)
+@@ -194,6 +217,51 @@ impl BitmapCache {
+     }
+ }
+ 
++/// Flash's largest cacheAsBitmap / filter picture: 8191 pixels a side and 16,777,215 pixels in
++/// all from SWF 10 on (Flash Player 10), 2880 a side before. (Sizes in screen pixels.)
++fn cache_size_acceptable(width: u32, height: u32, swf_version: u8) -> bool {
++    if swf_version > 9 {
++        let total = u64::from(width) * u64::from(height);
++        width < 8191 && height < 8191 && total < 16777215
++    } else {
++        width < 2880 && height < 2880
++    }
++}
++
++thread_local! {
++    /// AQW build: the product of the reductions of the cached pictures being drawn into (see
++    /// `cache_reduction`): 1 outside them. Their contents are drawn this much smaller than on
++    /// screen, so the filters of cached objects inside them are scaled down by it too.
++    static CACHE_SCALE: Cell<f32> = const { Cell::new(1.0) };
++}
++
++/// AQW build: the matrix filters are scaled by (and filter growth is measured with): the
++/// stage's view matrix, times the reduction of the cached pictures being drawn into.
++fn filter_view_matrix(stage_matrix: Matrix) -> Matrix {
++    let scale = CACHE_SCALE.with(Cell::get);
++    if scale == 1.0 {
++        return stage_matrix;
++    }
++    Matrix {
++        a: stage_matrix.a * scale,
++        b: stage_matrix.b * scale,
++        c: stage_matrix.c * scale,
++        d: stage_matrix.d * scale,
++        ..stage_matrix
++    }
++}
++
++/// AQW build: whether a cached object too big for Flash's limits is drawn smaller instead of
++/// without its cache and filters (Flash's own behaviour, kept with `RUFFLE_FLASH_CACHE_LIMITS=1`).
++fn cache_reduction_enabled() -> bool {
++    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ENABLED.get_or_init(|| std::env::var("RUFFLE_FLASH_CACHE_LIMITS").as_deref() != Ok("1"))
++}
++
++/// AQW build: the smallest reduction used. A picture that would have to be drawn smaller than
++/// this is skipped as Flash does (such bounds are usually broken, not a real object).
++const MIN_CACHE_SCALE: f32 = 0.25;
++
+ #[derive(Clone)]
+ pub struct RenderOptions {
+     /// Whether to skip rendering masks.
+@@ -318,6 +386,18 @@ pub struct DisplayObjectBase<'gc> {
  
      /// Rectangle used for 9-slice scaling (`DisplayObject.scale9grid`).
      scaling_grid: Cell<Rectangle<Twips>>,
@@ -3295,7 +3377,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
  }
  
  #[derive(Clone)]
-@@ -363,6 +387,9 @@ impl Default for DisplayObjectBase<'_> {
+@@ -363,6 +443,9 @@ impl Default for DisplayObjectBase<'_> {
              scroll_rect: Cell::new(None),
              next_scroll_rect: Default::default(),
              scaling_grid: Default::default(),
@@ -3305,7 +3387,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          }
      }
  }
-@@ -373,6 +400,7 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -373,6 +456,7 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_flag(&self, flag: DisplayObjectFlags, value: bool) {
@@ -3313,7 +3395,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          let mut flags = self.flags.get();
          flags.set(flag, value);
          self.flags.set(flags);
-@@ -389,6 +417,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -389,6 +473,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_depth(&self, depth: Depth) {
@@ -3322,7 +3404,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          self.depth.set(depth);
      }
  
-@@ -418,8 +448,17 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -418,8 +504,17 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      pub fn set_matrix(&self, matrix: Matrix) {
@@ -3340,7 +3422,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
      }
  
      pub fn color_transform(&self) -> ColorTransform {
-@@ -427,6 +466,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -427,6 +522,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      pub fn set_color_transform(&self, color_transform: ColorTransform) {
@@ -3349,7 +3431,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          self.color_transform.set(color_transform);
      }
  
-@@ -438,6 +479,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -438,6 +535,8 @@ impl<'gc> DisplayObjectBase<'gc> {
          &self,
          perspective_projection: Option<PerspectiveProjection>,
      ) -> bool {
@@ -3358,7 +3440,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          let old = self.perspective_projection.replace(perspective_projection);
          perspective_projection != old
      }
-@@ -447,10 +490,13 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -447,10 +546,13 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_x(&self, x: Twips) -> bool {
@@ -3372,7 +3454,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          self.set_transformed_by_script(true);
          changed
      }
-@@ -460,10 +506,13 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -460,10 +562,13 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_y(&self, y: Twips) -> bool {
@@ -3386,7 +3468,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          self.set_transformed_by_script(true);
          changed
      }
-@@ -473,6 +522,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -473,6 +578,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_z(&self, tz: f64) -> bool {
@@ -3395,7 +3477,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          let changed = self.tz.get() != tz;
          self.set_transformed_by_script(true);
          self.tz.set(tz);
-@@ -521,6 +572,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -521,6 +628,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_rotation(&self, degrees: Degrees) -> bool {
@@ -3404,7 +3486,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          self.set_transformed_by_script(true);
          self.cache_scale_rotation();
          let changed = self.rotation.get() != degrees;
-@@ -552,6 +605,7 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -552,6 +661,7 @@ impl<'gc> DisplayObjectBase<'gc> {
          matrix.c = (scale_y * -sin_y) as f32;
          matrix.d = (scale_y * cos_y) as f32;
          self.matrix.set(matrix);
@@ -3412,7 +3494,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
  
          changed
      }
-@@ -562,6 +616,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -562,6 +672,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_scale_x(&self, mut value: Percent) -> bool {
@@ -3421,7 +3503,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          let changed = self.scale_x.get() != value;
          self.set_transformed_by_script(true);
          self.cache_scale_rotation();
-@@ -587,6 +643,7 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -587,6 +699,7 @@ impl<'gc> DisplayObjectBase<'gc> {
          matrix.a = (cos * value.unit()) as f32;
          matrix.b = (sin * value.unit()) as f32;
          self.matrix.set(matrix);
@@ -3429,7 +3511,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
  
          changed
      }
-@@ -597,6 +654,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -597,6 +710,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_scale_y(&self, mut value: Percent) -> bool {
@@ -3438,7 +3520,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          let changed = self.scale_y.get() != value;
          self.set_transformed_by_script(true);
          self.cache_scale_rotation();
-@@ -623,6 +682,7 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -623,6 +738,7 @@ impl<'gc> DisplayObjectBase<'gc> {
          matrix.c = (-sin * value.unit()) as f32;
          matrix.d = (cos * value.unit()) as f32;
          self.matrix.set(matrix);
@@ -3446,7 +3528,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
  
          changed
      }
-@@ -640,6 +700,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -640,6 +756,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_filters(&self, filters: Box<[Filter]>) -> bool {
@@ -3455,7 +3537,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          let mut write = self.cell.borrow_mut();
          let changed = filters != write.filters;
          write.filters = filters;
-@@ -655,6 +717,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -655,6 +773,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_alpha(&self, value: f64) -> bool {
@@ -3464,7 +3546,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          self.set_transformed_by_script(true);
          let value = Fixed8::from_f64(value);
          let mut tf = self.color_transform.get();
-@@ -669,6 +733,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -669,6 +789,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_clip_depth(&self, depth: Depth) {
@@ -3473,7 +3555,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          self.clip_depth.set(depth);
      }
  
-@@ -679,6 +745,13 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -679,6 +801,16 @@ impl<'gc> DisplayObjectBase<'gc> {
      /// You should almost always use `DisplayObject.set_parent` instead, which
      /// properly handles 'orphan' movie clips
      fn set_parent_ignoring_orphan_list(this: &Write<Self>, parent: Option<DisplayObject<'gc>>) {
@@ -3484,10 +3566,13 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
 +        // (And for lean render: itself, the ancestors it had and those it gets.)
 +        replay::mark_dirty(this);
 +        replay::mark_dirty_from(parent);
++        if parent.is_none() {
++            replay::hidden();
++        }
          unlock!(this, Self, parent).set(parent)
      }
  
-@@ -703,6 +776,10 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -703,6 +835,10 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_avm1_pending_removal(&self, value: bool) {
@@ -3498,16 +3583,20 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          self.set_flag(DisplayObjectFlags::AVM1_PENDING_REMOVAL, value);
      }
  
-@@ -732,6 +809,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -732,7 +868,12 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_visible(&self, value: bool) -> bool {
 +        replay::changed();
 +        replay::mark_dirty(self);
          let changed = self.visible() != value;
++        if changed && !value {
++            replay::hidden();
++        }
          self.set_flag(DisplayObjectFlags::VISIBLE, value);
          changed
-@@ -742,6 +821,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+     }
+@@ -742,6 +883,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_blend_mode(&self, value: ExtendedBlendMode) -> bool {
@@ -3516,7 +3605,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          self.blend_mode.replace(value) != value
      }
  
-@@ -750,6 +831,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -750,6 +893,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_blend_shader(&self, value: Option<PixelBenderShaderHandle>) {
@@ -3525,7 +3614,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          self.cell.borrow_mut().blend_shader = value;
      }
  
-@@ -764,6 +847,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -764,6 +909,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      /// triggers cache-as-bitmap behavior. Only solid backgrounds are supported; the alpha channel
      /// is ignored.
      fn set_opaque_background(&self, value: Option<Color>) -> bool {
@@ -3534,7 +3623,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          let value = value.map(|mut color| {
              color.a = 255;
              color
-@@ -834,6 +919,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -834,6 +981,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_bitmap_cached_preference(&self, value: bool) {
@@ -3543,7 +3632,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          self.set_flag(DisplayObjectFlags::CACHE_AS_BITMAP, value);
          self.recheck_cache_as_bitmap();
      }
-@@ -848,6 +935,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -848,6 +997,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      /// Any subsequent calls will return false, indicating that you do not need to invalidate the ancestors.
      /// This is reset during rendering.
      fn invalidate_cached_bitmap(&self) -> bool {
@@ -3552,7 +3641,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          if self.contains_flag(DisplayObjectFlags::CACHE_INVALIDATED) {
              return false;
          }
-@@ -885,6 +974,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -885,6 +1036,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_has_scroll_rect(&self, value: bool) {
@@ -3561,7 +3650,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          self.set_flag(DisplayObjectFlags::HAS_SCROLL_RECT, value);
      }
  
-@@ -901,6 +992,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -901,6 +1054,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_masker(this: &Write<Self>, node: Option<DisplayObject<'gc>>) {
@@ -3570,7 +3659,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          unlock!(this, Self, masker).set(node);
      }
  
-@@ -909,6 +1002,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -909,6 +1064,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_maskee(this: &Write<Self>, node: Option<DisplayObject<'gc>>) {
@@ -3579,16 +3668,23 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          unlock!(this, Self, maskee).set(node);
      }
  
-@@ -959,6 +1054,8 @@ impl BoundsMode {
+@@ -959,10 +1116,15 @@ impl BoundsMode {
  struct DrawCacheInfo {
      bitmap: BitmapInfo,
      dirty: bool,
 +    /// AQW build: `bitmap` was made for this draw (see `deferred_shapes`).
 +    fresh: bool,
++    /// (With a reduced picture, its matrix is the object's matrix times the reduction.)
      base_transform: Transform,
      bounds: Rectangle<Twips>,
      draw_offset: Point<i32>,
-@@ -970,13 +1067,63 @@ pub fn render_base<'gc>(
+     filters: Vec<Filter>,
++    /// AQW build: how much smaller than on screen the picture is drawn (1: the same size).
++    scale: f32,
+ }
+ 
+ pub fn render_base<'gc>(
+@@ -970,13 +1132,63 @@ pub fn render_base<'gc>(
      context: &mut RenderContext<'_, 'gc>,
      options: RenderOptions,
  ) {
@@ -3653,7 +3749,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          context.transform_stack.push(&transform);
      }
  
-@@ -986,6 +1133,11 @@ pub fn render_base<'gc>(
+@@ -986,21 +1198,46 @@ pub fn render_base<'gc>(
      } else {
          None
      };
@@ -3665,9 +3761,14 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
  
      let cache_info = if context.use_bitmap_cache && this.is_bitmap_cached() {
          let mut cache_info: Option<DrawCacheInfo> = None;
-@@ -996,11 +1148,18 @@ pub fn render_base<'gc>(
-             &context.stage.view_matrix(),
-         );
+         let base_transform = context.transform_stack.transform();
+-        let bounds: Rectangle<Twips> = this.render_bounds_with_transform(
+-            &base_transform.matrix,
+-            false, // we want to do the filter growth for this object ourselves, to know the offsets
+-            &context.stage.view_matrix(),
+-        );
++        // AQW build: times the reduction of the cached pictures this one is drawn into.
++        let view_matrix = filter_view_matrix(context.stage.view_matrix());
          let name = this.name();
 +        let opaque_background = this.opaque_background();
          let mut filters: Vec<Filter> = this.filters().to_owned();
@@ -3675,33 +3776,106 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          filters.retain(|f| !f.impotent());
 +        // AQW build: with frame interpolation, a glow that pulses is drawn in between too.
 +        let filters_blended = this.base().interp.blend_filters(&mut filters);
++        // AQW build: a picture too big for Flash's limits is drawn smaller (`scale` < 1) and
++        // stretched back, instead of the object losing its filters (see `cache_reduction`).
++        // `cache_matrix` is the object's matrix times the reduction, `bounds` measured with it.
++        let (scale, cache_matrix, bounds) = cache_reduction(
++            this,
++            &base_transform.matrix,
++            &view_matrix,
++            &filters,
++            opaque_background,
++            swf_version,
++        );
++        let cache_transform = Transform {
++            matrix: cache_matrix,
++            ..base_transform.clone()
++        };
  
 +        // AQW build: logged after the cache borrow ends (it reads the object's filters).
 +        let mut log_oversize = false;
 +        let oversize_matrix = base_transform.matrix;
          if let Some(cache) = &mut *this.base().bitmap_cache_mut() {
++            let base_transform = cache_transform;
 +            let bounds = stabilize_cache_bounds(cache, bounds, &base_transform.matrix);
              let width = bounds.width().to_pixels().ceil().max(0.0);
              let height = bounds.height().to_pixels().ceil().max(0.0);
              if width <= u16::MAX as f64 && height <= u16::MAX as f64 {
-@@ -1025,18 +1184,38 @@ pub fn render_base<'gc>(
+@@ -1012,7 +1249,7 @@ pub fn render_base<'gc>(
+                     y_min: Twips::ZERO,
+                     y_max: Twips::from_pixels_i32(height as i32),
+                 };
+-                let stage_matrix = context.stage.view_matrix();
++                let stage_matrix = scaled_matrix(&view_matrix, scale);
+                 for filter in &mut filters {
+                     // Scaling is done by *stage view matrix* only, nothing in-between
+                     filter.scale(stage_matrix.a, stage_matrix.d);
+@@ -1025,35 +1262,109 @@ pub fn render_base<'gc>(
                      y_max: filter_rect.y_max.to_pixels().ceil() as i32,
                  };
                  let draw_offset = Point::new(filter_rect.x_min, filter_rect.y_min);
 -                if cache.is_dirty(&base_transform.matrix, width, height) {
 +                let contents_moving = interp::active()
-+                    && (cache.aqw_changed_frame == interp::frame() || filters_blended);
++                    && (cache.aqw_changed_frame == interp::frame()
++                        || filters_blended
++                        || (cache.aqw_moved_frame == interp::frame()
++                            && !self_check::fault_as_201()));
 +                // AQW build: drawn blank, left as it was, or drawn with a cached part that
 +                // was, because shapes weren't ready (see `deferred_shapes`), and they are now:
 +                // drawn again. (A cached object this one is drawn into waits for the same
 +                // shapes, so it's walked again, and this one with it, in the same picture.)
++                // AQW build: a self-check's dry walk (see `self_check`) changes no cache: it
++                // notes which would be drawn again, and draws what they hold.
++                let dry = interp::dry();
 +                let shapes_pending = cache.bitmap().is_some_and(|bitmap| {
-+                    graphic::deferred_shapes::take_cache_pending(&bitmap.handle)
++                    if dry {
++                        graphic::deferred_shapes::cache_pending_done(&bitmap.handle)
++                    } else {
++                        graphic::deferred_shapes::take_cache_pending(&bitmap.handle)
++                    }
 +                });
-+                if contents_moving
++                let settling = cache.aqw_moved_frame != 0
++                    && cache.aqw_moved_frame != interp::frame()
++                    && !self_check::fault_as_201();
++                let redraw = contents_moving
++                    || settling
 +                    || shapes_pending
-+                    || cache.is_dirty(&base_transform.matrix, width, height)
-+                {
++                    || cache.is_dirty(&base_transform.matrix, width, height);
++                if dry {
++                    if redraw {
++                        let why = if contents_moving {
++                            "its contents move in this frame"
++                        } else if settling {
++                            "it was drawn in between two frames"
++                        } else if shapes_pending {
++                            "its shapes are done"
++                        } else if cache.bitmap().is_none() {
++                            "it has no picture"
++                        } else if cache.source_width != width || cache.source_height != height {
++                            "its size changed"
++                        } else if cache.matrix_a.is_nan() {
++                            "it was invalidated"
++                        } else {
++                            "its scale or rotation changed"
++                        };
++                        self_check::would_redraw(
++                            this,
++                            cache.bitmap().map(|b| b.handle).as_ref(),
++                            why,
++                        );
++                    }
++                    cache_info = cache.bitmap().map(|bitmap| DrawCacheInfo {
++                        bitmap,
++                        dirty: false,
++                        fresh: false,
++                        base_transform,
++                        bounds,
++                        draw_offset,
++                        filters,
++                        scale,
++                    });
++                } else if redraw {
++                    cache.aqw_moved_frame = if filters_blended { interp::frame() } else { 0 };
 +                    let (texture_width, texture_height) = cache_texture_size(
 +                        filter_rect.width() as u32,
 +                        filter_rect.height() as u32,
@@ -3726,7 +3900,12 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
                          bitmap,
                          dirty: true,
                          base_transform,
-@@ -1048,6 +1227,7 @@ pub fn render_base<'gc>(
+                         bounds,
+                         draw_offset,
+                         filters,
++                        scale,
+                     });
+                 } else {
                      cache_info = cache.bitmap().map(|bitmap| DrawCacheInfo {
                          bitmap,
                          dirty: false,
@@ -3734,7 +3913,17 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
                          base_transform,
                          bounds,
                          draw_offset,
-@@ -1061,11 +1241,16 @@ pub fn render_base<'gc>(
+                         filters,
++                        scale,
+                     });
+                 }
++            } else if interp::dry() {
++                self_check::unsure("a cached object in it is too big to cache");
++                cache_info = None;
+             } else {
+                 if !cache.warned_for_oversize {
+                     tracing::warn!(
+@@ -1061,11 +1372,16 @@ pub fn render_base<'gc>(
                          name
                      );
                      cache.warned_for_oversize = true;
@@ -3746,20 +3935,25 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          }
 +        if log_oversize {
 +            // AQW build: say which part of the object has the huge bounds.
-+            aqw_log_oversize_parts(this, &oversize_matrix, &context.stage.view_matrix(), 0);
++            aqw_log_oversize_parts(this, &oversize_matrix, &view_matrix, 0);
 +        }
          cache_info
      } else {
          None
-@@ -1080,6 +1265,7 @@ pub fn render_base<'gc>(
+@@ -1080,6 +1396,12 @@ pub fn render_base<'gc>(
              + Twips::from_pixels_i32(cache_info.draw_offset.x);
          let offset_y = cache_info.bounds.y_min - cache_info.base_transform.matrix.ty
              + Twips::from_pixels_i32(cache_info.draw_offset.y);
 +        aqw_trace_cache_placement(this, &cache_info, offset_x, offset_y);
++
++        // AQW build: drawn from its kept picture: is that what its contents draw now?
++        if !cache_info.dirty && self_check::cache_verify() && !interp::dry() {
++            aqw_verify_cache(this, context, &cache_info);
++        }
  
          if cache_info.dirty {
              let mut transform_stack = TransformStack::new();
-@@ -1094,6 +1280,7 @@ pub fn render_base<'gc>(
+@@ -1094,6 +1416,7 @@ pub fn render_base<'gc>(
                  tz: Default::default(),
              });
              let mut offscreen_context = RenderContext {
@@ -3767,15 +3961,38 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
                  renderer: context.renderer,
                  commands: CommandList::new(),
                  cache_draws: context.cache_draws,
-@@ -1105,12 +1292,18 @@ pub fn render_base<'gc>(
+@@ -1105,12 +1428,41 @@ pub fn render_base<'gc>(
                  use_bitmap_cache: true,
                  stage: context.stage,
              };
 +            // AQW build: the cached objects walked inside this one list it as an ancestor
 +            // (see `deferred_shapes`).
 +            graphic::deferred_shapes::enter_cache(&cache_info.bitmap.handle);
++            // AQW build: cached objects inside a reduced picture scale their filters with it.
++            let outer_scale = CACHE_SCALE.with(|s| s.replace(s.get() * cache_info.scale));
++            let blends_before = interp::blends();
              this.render_self(&mut offscreen_context);
++            CACHE_SCALE.with(|s| s.set(outer_scale));
 +            let ancestors = graphic::deferred_shapes::leave_cache();
++            // AQW build: drawn in between two frames (see `aqw_moved_frame`).
++            if interp::blends() != blends_before
++                && let Some(cache) = &mut *this.base().bitmap_cache_mut()
++            {
++                cache.aqw_moved_frame = interp::frame();
++            }
++            // AQW build: what it's drawn from, for the check (see `self_check`).
++            if self_check::cache_verify()
++                && let Some(cache) = &mut *this.base().bitmap_cache_mut()
++            {
++                self_check::drawn(
++                    &mut cache.aqw_verify,
++                    &cache_info.bitmap.handle,
++                    offscreen_context.transform_stack.transform(),
++                    &offscreen_context.commands.commands,
++                    &cache_info.filters,
++                    this.opaque_background().unwrap_or_default(),
++                );
++            }
              offscreen_context.cache_draws.push(BitmapCacheEntry {
                  handle: cache_info.bitmap.handle.clone(),
                  commands: offscreen_context.commands,
@@ -3786,7 +4003,52 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
              });
          }
  
-@@ -1161,28 +1354,71 @@ pub fn render_base<'gc>(
+@@ -1120,14 +1472,30 @@ pub fn render_base<'gc>(
+             context,
+             |context| {
+                 let region = cache_info.bitmap.full_region();
++                let matrix = if cache_info.scale == 1.0 {
++                    Matrix {
++                        tx: context.transform_stack.transform().matrix.tx + offset_x,
++                        ty: context.transform_stack.transform().matrix.ty + offset_y,
++                        ..Default::default()
++                    }
++                } else {
++                    // AQW build: a reduced picture (its offsets are in its own, smaller pixels)
++                    // is stretched back to its size on screen.
++                    let inverse = 1.0 / f64::from(cache_info.scale);
++                    Matrix {
++                        a: inverse as f32,
++                        d: inverse as f32,
++                        tx: context.transform_stack.transform().matrix.tx
++                            + Twips::from_pixels(offset_x.to_pixels() * inverse),
++                        ty: context.transform_stack.transform().matrix.ty
++                            + Twips::from_pixels(offset_y.to_pixels() * inverse),
++                        ..Default::default()
++                    }
++                };
+                 context.commands.render_bitmap(
+                     cache_info.bitmap.handle,
+                     Transform {
+-                        matrix: Matrix {
+-                            tx: context.transform_stack.transform().matrix.tx + offset_x,
+-                            ty: context.transform_stack.transform().matrix.ty + offset_y,
+-                            ..Default::default()
+-                        },
++                        matrix,
+                         color_transform: cache_info.base_transform.color_transform,
+                         perspective_projection: cache_info.base_transform.perspective_projection,
+                         tz: cache_info.base_transform.tz,
+@@ -1146,7 +1514,7 @@ pub fn render_base<'gc>(
+             let bounds: Rectangle<Twips> = this.render_bounds_with_transform(
+                 &context.transform_stack.transform().matrix,
+                 true,
+-                &context.stage.view_matrix(),
++                &filter_view_matrix(context.stage.view_matrix()),
+             );
+             context
+                 .commands
+@@ -1161,28 +1529,139 @@ pub fn render_base<'gc>(
      }
  
      if let Some(original_commands) = original_commands {
@@ -3847,6 +4109,74 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
 +    }
 +}
 +
++/// AQW build: `RUFFLE_CACHE_VERIFY` (see `self_check`): `this` is drawn from its kept picture
++/// (`info`); once per SWF frame its contents are walked again, dry, inside the transform they
++/// were drawn inside, and compared with what the picture was drawn from.
++fn aqw_verify_cache<'gc>(
++    this: DisplayObject<'gc>,
++    context: &mut RenderContext<'_, 'gc>,
++    info: &DrawCacheInfo,
++) {
++    let handle = &info.bitmap.handle;
++    if graphic::deferred_shapes::cache_waits(handle) {
++        // Waiting for shapes: it keeps its last picture on purpose.
++        self_check::waiting();
++        return;
++    }
++    let Some(root) = this
++        .base()
++        .bitmap_cache_mut()
++        .as_mut()
++        .and_then(|cache| self_check::due(&mut cache.aqw_verify))
++    else {
++        return;
++    };
++    let mut transform_stack = TransformStack::new();
++    transform_stack.push(&root);
++    let mut scratch = Vec::new();
++    let mut offscreen_context = RenderContext {
++        recorder: None,
++        renderer: context.renderer,
++        commands: CommandList::new(),
++        cache_draws: &mut scratch,
++        gc_context: context.gc_context,
++        library: context.library,
++        ui: context.ui,
++        transform_stack: &mut transform_stack,
++        is_offscreen: true,
++        use_bitmap_cache: true,
++        stage: context.stage,
++    };
++    interp::dry_begin();
++    self_check::dry_scope();
++    graphic::deferred_shapes::enter_cache(handle);
++    let outer_scale = CACHE_SCALE.with(|s| s.replace(s.get() * info.scale));
++    this.render_self(&mut offscreen_context);
++    CACHE_SCALE.with(|s| s.set(outer_scale));
++    graphic::deferred_shapes::leave_cache();
++    interp::dry_end();
++    let commands = offscreen_context.commands.commands;
++    // (Out of the cache while it's judged: the report reads the object.)
++    let Some(mut slot) = this
++        .base()
++        .bitmap_cache_mut()
++        .as_mut()
++        .map(|cache| std::mem::take(&mut cache.aqw_verify))
++    else {
++        return;
++    };
++    self_check::judge(
++        this,
++        &mut slot,
++        &commands,
++        &info.filters,
++        this.opaque_background().unwrap_or_default(),
++    );
++    if let Some(cache) = &mut *this.base().bitmap_cache_mut() {
++        cache.aqw_verify = slot;
++    }
++}
++
 +/// AQW build: `local_to_global_matrix` with the matrices objects are drawn with during frame
 +/// interpolation.
 +fn blended_global_matrix(object: DisplayObject<'_>) -> Matrix {
@@ -3871,7 +4201,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
  }
  
  /// This applies the **standard** method of `mask` and `scrollRect`.
-@@ -1225,10 +1461,18 @@ pub fn apply_standard_mask_and_scroll<'gc, F>(
+@@ -1225,10 +1704,18 @@ pub fn apply_standard_mask_and_scroll<'gc, F>(
      let mask = this.get_render_mask();
      let mut mask_transform = ruffle_render::transform::Transform::default();
      if let RenderMask::Stencil(m) | RenderMask::Alpha(m) = mask {
@@ -3893,7 +4223,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
      }
      if let RenderMask::Stencil(m) = mask {
          context.commands.push_mask();
-@@ -1517,7 +1761,75 @@ pub trait TDisplayObject<'gc>:
+@@ -1517,7 +2004,75 @@ pub trait TDisplayObject<'gc>:
      /// Returns the matrix for transforming from this object's local space to global stage space,
      /// without applying the translation of this object's own scroll rect.
      #[no_dynamic]
@@ -3969,7 +4299,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          let mut node = self.parent();
          let mut matrix = self.base().matrix();
          while let Some(display_object) = node {
-@@ -1953,6 +2265,10 @@ pub trait TDisplayObject<'gc>:
+@@ -1953,6 +2508,10 @@ pub trait TDisplayObject<'gc>:
      /// Set the parent of this display object.
      #[no_dynamic]
      fn set_parent(self, context: &mut UpdateContext<'gc>, parent: Option<DisplayObject<'gc>>) {
@@ -3980,7 +4310,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          let had_parent = self.parent().is_some();
          let write = Gc::write(context.gc(), self.base());
          DisplayObjectBase::set_parent_ignoring_orphan_list(write, parent);
-@@ -2091,6 +2407,8 @@ pub trait TDisplayObject<'gc>:
+@@ -2091,6 +2650,8 @@ pub trait TDisplayObject<'gc>:
  
      #[no_dynamic]
      fn set_scaling_grid(self, rect: Rectangle<Twips>) {
@@ -3989,7 +4319,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          self.base().scaling_grid.set(rect);
      }
  
-@@ -2284,7 +2602,9 @@ pub trait TDisplayObject<'gc>:
+@@ -2284,7 +2845,9 @@ pub trait TDisplayObject<'gc>:
      /// Sets whether this display object has a scroll rectangle applied.
      #[no_dynamic]
      fn set_has_scroll_rect(self, value: bool) {
@@ -4000,8 +4330,14 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
      }
  
      /// Whether this display object has been created by ActionScript 1/2.
-@@ -2503,8 +2823,12 @@ pub trait TDisplayObject<'gc>:
+@@ -2501,10 +3064,18 @@ pub trait TDisplayObject<'gc>:
+     /// (as long as the child is still on a render list)
+     #[no_dynamic]
      fn pre_render(self, _context: &mut RenderContext<'_, 'gc>) {
++        // AQW build: a self-check's dry walk changes nothing (see `self_check`).
++        if interp::dry() {
++            return;
++        }
          let this = self.base();
          this.clear_invalidate_flag();
 -        this.scroll_rect
@@ -4015,7 +4351,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
      }
  
      fn render_self(self, _context: &mut RenderContext<'_, 'gc>) {}
-@@ -2841,6 +3165,9 @@ pub trait TDisplayObject<'gc>:
+@@ -2841,6 +3412,9 @@ pub trait TDisplayObject<'gc>:
      /// If this object or any ancestor is marked as cacheAsBitmap, it will invalidate that cache.
      #[no_dynamic]
      fn invalidate_cached_bitmap(self) {
@@ -4025,7 +4361,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
          if self.base().invalidate_cached_bitmap() {
              // Don't inform ancestors if we've already done so this frame
              if let Some(parent) = self.parent() {
-@@ -3296,3 +3623,479 @@ impl<'gc> DisplayObjectWeak<'gc> {
+@@ -3296,3 +3870,599 @@ impl<'gc> DisplayObjectWeak<'gc> {
          }
      }
  }
@@ -4411,8 +4747,9 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
 +        return;
 +    }
 +    let m = &info.base_transform.matrix;
-+    let x = (m.tx + offset_x).to_pixels();
-+    let y = (m.ty + offset_y).to_pixels();
++    // (A reduced picture's matrix and offsets are in its own, smaller pixels.)
++    let x = (m.tx + offset_x).to_pixels() / f64::from(info.scale);
++    let y = (m.ty + offset_y).to_pixels() / f64::from(info.scale);
 +    tracing::info!(
 +        target: "ruffle_aqw_trace",
 +        "cache {:?}: dirty {} bounds x {:.3}..{:.3} y {:.3}..{:.3} tx {:.3} ty {:.3} draw_offset {:?} -> placed at x {:.3} (err {:+.3}) y {:.3} (err {:+.3}) scale {:.4}",
@@ -4473,6 +4810,125 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..c7aa661d77469e3e0287dfa051ed09e5
 +        size.div_ceil(step) * step
 +    };
 +    (step_up(width), step_up(height))
++}
++
++/// AQW build: `matrix` with its scale/rotation part times `scale` (its translation kept).
++fn scaled_matrix(matrix: &Matrix, scale: f32) -> Matrix {
++    if scale == 1.0 {
++        return *matrix;
++    }
++    Matrix {
++        a: matrix.a * scale,
++        b: matrix.b * scale,
++        c: matrix.c * scale,
++        d: matrix.d * scale,
++        ..*matrix
++    }
++}
++
++/// AQW build: how much smaller than on screen a cacheAsBitmap object (with its filters) is
++/// drawn, the matrix it's drawn with into its picture, and its bounds under that matrix.
++///
++/// Flash gives a cached or filtered object no picture when that would be over 8191 pixels a
++/// side or 16,777,215 pixels in all (2880 a side before SWF 10), counted in screen pixels:
++/// the object is then drawn without its filters. AQW draws its 960x550 stage at the window's
++/// size, so on a big window (4K: about 3.9 times) a room's backdrop with a color matrix filter
++/// (in /sevencircleswar, 1.3 million stage pixels with its parts out of view) crosses it and
++/// loses its colors, while the game's launcher draws it small and keeps them. Here such an
++/// object's picture is drawn at the largest scale that fits (filters scaled with it) and
++/// stretched back: a little softer than the rest of the screen, but with its filters.
++/// Below `MIN_CACHE_SCALE`, or with `RUFFLE_FLASH_CACHE_LIMITS=1`, Flash's behaviour is kept.
++/// Returns scale 1 and `matrix` itself when the picture fits.
++fn cache_reduction<'gc>(
++    this: DisplayObject<'gc>,
++    matrix: &Matrix,
++    view_matrix: &Matrix,
++    filters: &[Filter],
++    opaque_background: Option<Color>,
++    swf_version: u8,
++) -> (f32, Matrix, Rectangle<Twips>) {
++    let measure = |scale: f32| {
++        let matrix = if scale == 1.0 {
++            *matrix
++        } else {
++            Matrix::scale(scale, scale) * *matrix
++        };
++        let view = scaled_matrix(view_matrix, scale);
++        // (The object's own filters are grown below, as `render_base` does.)
++        let bounds = this.render_bounds_with_transform(&matrix, false, &view);
++        (matrix, view, bounds)
++    };
++    // The texture `render_base` would ask for (`margin`: one pixel more each way for
++    // `stabilize_cache_bounds`), or `None` past the u16 limit it has.
++    let texture_size = |view: &Matrix,
++                        bounds: &Rectangle<Twips>,
++                        margin: f64|
++     -> Option<(u32, u32)> {
++        let width = bounds.width().to_pixels().ceil().max(0.0) + margin;
++        let height = bounds.height().to_pixels().ceil().max(0.0) + margin;
++        if width > u16::MAX as f64 || height > u16::MAX as f64 {
++            return None;
++        }
++        let mut rect = Rectangle {
++            x_min: Twips::ZERO,
++            x_max: Twips::from_pixels(width),
++            y_min: Twips::ZERO,
++            y_max: Twips::from_pixels(height),
++        };
++        for filter in filters {
++            let mut filter = filter.clone();
++            filter.scale(view.a, view.d);
++            rect = filter.calculate_dest_rect(rect);
++        }
++        let width = rect.x_max.to_pixels().ceil() - rect.x_min.to_pixels().floor();
++        let height = rect.y_max.to_pixels().ceil() - rect.y_min.to_pixels().floor();
++        Some(cache_texture_size(
++            width.max(0.0) as u32,
++            height.max(0.0) as u32,
++            filters,
++            opaque_background,
++        ))
++    };
++    let fits = |size: Option<(u32, u32)>| {
++        size.is_some_and(|(width, height)| cache_size_acceptable(width, height, swf_version))
++    };
++
++    let (full_matrix, full_view, full_bounds) = measure(1.0);
++    if !cache_reduction_enabled() || !full_bounds.is_valid() {
++        return (1.0, full_matrix, full_bounds);
++    }
++    // (Without the margin here: whatever fitted before, before `stabilize_cache_bounds`
++    // could only grow it, still gets scale 1 and is drawn exactly as before.)
++    let Some((width, height)) = texture_size(&full_view, &full_bounds, 0.0) else {
++        return (1.0, full_matrix, full_bounds);
++    };
++    if cache_size_acceptable(width, height, swf_version) || width == 0 || height == 0 {
++        return (1.0, full_matrix, full_bounds);
++    }
++    let (max_side, max_total) = if swf_version > 9 {
++        (8190.0, 16_777_214.0)
++    } else {
++        (2879.0, f64::INFINITY)
++    };
++    let (width, height) = (f64::from(width), f64::from(height));
++    let mut scale = (max_side / width)
++        .min(max_side / height)
++        .min((max_total / (width * height)).sqrt()) as f32;
++    // (Filter growth and rounding don't shrink exactly with the scale: a few tries.) The scale
++    // is rounded down to 1/128: an animated object whose bounds change a little keeps its scale,
++    // so its matrix, and its picture isn't redrawn (and remade at another size) for that alone.
++    for _ in 0..8 {
++        scale = (scale * 128.0).floor() / 128.0;
++        if scale < MIN_CACHE_SCALE {
++            break;
++        }
++        let (matrix, view, bounds) = measure(scale);
++        if fits(texture_size(&view, &bounds, 1.0)) {
++            return (scale, matrix, bounds);
++        }
++        scale *= 0.97;
++    }
++    (1.0, full_matrix, full_bounds)
 +}
 +
 +/// AQW build: keeps an animated cacheAsBitmap object from shaking.
@@ -4685,7 +5141,7 @@ index 422efa6c5579c7d0f080e492a619ec79276c316e..e1e2048f6f693b2505fc451d47360e0e
  
      /// Calculate and return the [`TextSelection`] at the given position
 diff --git a/core/src/display_object/graphic.rs b/core/src/display_object/graphic.rs
-index 0ba54d1a77a6f2568699fd9639b9fad6ddf12342..641503194b1fa9fadd56b2dab2704863d5704ce2 100644
+index 0ba54d1a77a6f2568699fd9639b9fad6ddf12342..a2dad3dddf84adc32c6902101cd89529d62986d4 100644
 --- a/core/src/display_object/graphic.rs
 +++ b/core/src/display_object/graphic.rs
 @@ -9,7 +9,7 @@ use crate::drawing::Drawing;
@@ -5036,7 +5492,7 @@ index 0ba54d1a77a6f2568699fd9639b9fad6ddf12342..641503194b1fa9fadd56b2dab2704863
  
      #[collect(require_static)]
      shape_bounds: Rectangle<Twips>,
-@@ -341,6 +490,1164 @@ struct GraphicShared<'gc> {
+@@ -341,6 +490,1181 @@ struct GraphicShared<'gc> {
      #[collect(require_static)]
      edge_bounds: Rectangle<Twips>,
  
@@ -5302,6 +5758,23 @@ index 0ba54d1a77a6f2568699fd9639b9fad6ddf12342..641503194b1fa9fadd56b2dab2704863
 +                true
 +            }
 +        }
++    }
++
++    /// `take_cache_pending` without taking: for a self-check's dry walk (see `self_check`).
++    pub fn cache_pending_done(handle: &BitmapHandle) -> bool {
++        let key = cache_key(handle);
++        PENDING_CACHES.with_borrow(|pending| {
++            pending.get(&key).is_some_and(|(_, tickets)| {
++                RUNNING.with_borrow(|running| !tickets.iter().any(|t| running.contains_key(t)))
++            })
++        })
++    }
++
++    /// Whether the cached object drawn into `handle` waits for shapes (still being made, or
++    /// done and not drawn yet): it keeps its last picture meanwhile (see `self_check`).
++    pub fn cache_waits(handle: &BitmapHandle) -> bool {
++        let key = cache_key(handle);
++        PENDING_CACHES.with_borrow(|pending| pending.contains_key(&key))
 +    }
 +
 +    /// Adds `tickets` to what the cached object drawn into `handle` waits for.
@@ -6281,10 +6754,10 @@ index 1cd38a85da70b376d6ef2489f9d47c81486b7d45..29fce9227c825a85aac2d069dfbb6984
              ClipEvent::RollOver { from } | ClipEvent::DragOver { from } => {
 diff --git a/core/src/display_object/interp.rs b/core/src/display_object/interp.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..7a727594f155d81c2b826bc876a317c431f3c3f7
+index 0000000000000000000000000000000000000000..0586854ae94d8293d450a9575fa9adcff0f44feb
 --- /dev/null
 +++ b/core/src/display_object/interp.rs
-@@ -0,0 +1,1097 @@
+@@ -0,0 +1,1267 @@
 +//! AQW build (Mugetsu): frame interpolation, an option that is off by default.
 +//!
 +//! AQW runs its scripts and timelines at 24-30 frames a second. With interpolation on, the
@@ -6401,6 +6874,7 @@ index 0000000000000000000000000000000000000000..7a727594f155d81c2b826bc876a317c4
 +/// What an object looked like: its transform, and its ratio (how far a shape tween is).
 +type Look = (Matrix, ColorTransform, u16);
 +
++#[derive(Clone)]
 +struct State {
 +    /// The SWF frame this object was last drawn in, and how it looked then.
 +    frame: u64,
@@ -6517,13 +6991,13 @@ index 0000000000000000000000000000000000000000..7a727594f155d81c2b826bc876a317c4
 +    /// drawn in the frame before.
 +    fn join(&mut self, rhythm: &Rhythm, frame: u64, drawn_before: bool) {
 +        let moved = self.ratio_changed == frame;
-+        let beat = rhythm.0.get();
++        let beat = rhythm.get();
 +        if moved && self.ratio_span > 1 {
 +            let span = match beat {
 +                Some(beat) if beat.frame == frame => beat.span.max(self.ratio_span),
 +                _ => self.ratio_span,
 +            };
-+            rhythm.0.set(Some(Beat { frame, span }));
++            rhythm.set(Some(Beat { frame, span }));
 +            return;
 +        }
 +        let Some(beat) = beat else {
@@ -6579,7 +7053,110 @@ index 0000000000000000000000000000000000000000..7a727594f155d81c2b826bc876a317c4
 +    }
 +}
 +
++// ---------------------------------------------------------------------------------------------
++// Dry walks (the self-checks only, see `self_check`): a walk that makes the commands a walk
++// would make now and changes nothing. What a walk writes into the trackers (how each object
++// looked in this frame, a tween's rhythm) goes into a scratch copy instead, read back by the
++// same dry walk and dropped at its end, so the next real walk finds the trackers as they were.
++
++/// Whether a dry walk was ever begun (so a walk that never makes one asks no thread-local).
++static DRY_USED: AtomicBool = AtomicBool::new(false);
++
++thread_local! {
++    static DRY_DEPTH: Cell<u32> = const { Cell::new(0) };
++    /// The dry walk's trackers and rhythms, by their address.
++    static DRY_STATES: std::cell::RefCell<std::collections::HashMap<usize, Option<Box<State>>>> =
++        std::cell::RefCell::new(std::collections::HashMap::new());
++    static DRY_BEATS: std::cell::RefCell<std::collections::HashMap<usize, Option<Beat>>> =
++        std::cell::RefCell::new(std::collections::HashMap::new());
++}
++
++thread_local! {
++    /// How many looks were drawn in between two frames so far (see `note_blend`).
++    static BLENDS: Cell<u64> = const { Cell::new(0) };
++}
++
++/// Something was drawn in between two frames (a transform, filters or a tween's ratio blended
++/// with the previous frame's, part of the way): a cached picture drawn with it is in between
++/// too (see `BitmapCache::aqw_moved_frame` in `display_object`). Not counted in a dry walk.
++pub fn note_blend() {
++    if !dry() {
++        BLENDS.with(|b| b.set(b.get() + 1));
++    }
++}
++
++/// How many looks were drawn in between two frames so far.
++pub fn blends() -> u64 {
++    BLENDS.with(Cell::get)
++}
++
++/// Whether a dry walk is under way (see above).
++#[inline]
++pub fn dry() -> bool {
++    DRY_USED.load(Ordering::Relaxed) && DRY_DEPTH.with(Cell::get) > 0
++}
++
++/// A dry walk begins (they nest); `dry_end` follows.
++pub fn dry_begin() {
++    DRY_USED.store(true, Ordering::Relaxed);
++    DRY_DEPTH.with(|d| d.set(d.get() + 1));
++}
++
++pub fn dry_end() {
++    let left = DRY_DEPTH.with(|d| {
++        d.set(d.get().saturating_sub(1));
++        d.get()
++    });
++    if left == 0 {
++        DRY_STATES.with_borrow_mut(|states| states.clear());
++        DRY_BEATS.with_borrow_mut(|beats| beats.clear());
++    }
++}
++
++impl Rhythm {
++    fn get(&self) -> Option<Beat> {
++        if dry() {
++            let key = self as *const Self as usize;
++            if let Some(beat) = DRY_BEATS.with_borrow(|beats| beats.get(&key).copied()) {
++                return beat;
++            }
++        }
++        self.0.get()
++    }
++
++    fn set(&self, beat: Option<Beat>) {
++        if dry() {
++            DRY_BEATS.with_borrow_mut(|beats| beats.insert(self as *const Self as usize, beat));
++        } else {
++            self.0.set(beat);
++        }
++    }
++}
++
 +impl Tracker {
++    /// The state, taken out (`put` gives it back). In a dry walk: the walk's copy.
++    fn take(&self) -> Option<Box<State>> {
++        if dry() {
++            let key = self as *const Self as usize;
++            if let Some(state) = DRY_STATES.with_borrow_mut(|states| states.remove(&key)) {
++                return state;
++            }
++            let real = self.0.take();
++            let copy = real.clone();
++            self.0.set(real);
++            return copy;
++        }
++        self.0.take()
++    }
++
++    fn put(&self, state: Option<Box<State>>) {
++        if dry() {
++            DRY_STATES.with_borrow_mut(|states| states.insert(self as *const Self as usize, state));
++        } else {
++            self.0.set(state);
++        }
++    }
++
 +    /// Records `transform` and `ratio` (the object's real ones) and blends the transform with
 +    /// the previous frame's, while the screen is drawn with interpolation. Returns the previous
 +    /// frame's matrix and color transform it was blended from, if any (see `replay`).
@@ -6589,7 +7166,7 @@ index 0000000000000000000000000000000000000000..7a727594f155d81c2b826bc876a317c4
 +        };
 +        let frame = frame();
 +        let current = (transform.matrix, transform.color_transform, ratio);
-+        let mut state = self.0.take().unwrap_or_else(|| {
++        let mut state = self.take().unwrap_or_else(|| {
 +            Box::new(State {
 +                frame: 0,
 +                seen: current,
@@ -6615,8 +7192,11 @@ index 0000000000000000000000000000000000000000..7a727594f155d81c2b826bc876a317c4
 +        state.frame = frame;
 +        state.seen = current;
 +        state.previous = previous;
-+        self.0.set(Some(state));
++        self.put(Some(state));
 +        let (matrix, color, _) = previous?;
++        if t < 1.0 && (matrix != transform.matrix || color != transform.color_transform) {
++            note_blend();
++        }
 +        blend_look((matrix, color), transform, t);
 +        Some((matrix, color))
 +    }
@@ -6631,7 +7211,7 @@ index 0000000000000000000000000000000000000000..7a727594f155d81c2b826bc876a317c4
 +        if BLEND.with(Cell::get).is_none() {
 +            return;
 +        }
-+        let Some(mut state) = self.0.take() else {
++        let Some(mut state) = self.take() else {
 +            return;
 +        };
 +        if state.frame < drawn_frame {
@@ -6641,7 +7221,7 @@ index 0000000000000000000000000000000000000000..7a727594f155d81c2b826bc876a317c4
 +            state.seen_filters = None;
 +            state.frame = drawn_frame;
 +        }
-+        self.0.set(Some(state));
++        self.put(Some(state));
 +    }
 +
 +    /// The matrix `matrix` (the object's real one) is drawn with right now, without recording.
@@ -6649,9 +7229,9 @@ index 0000000000000000000000000000000000000000..7a727594f155d81c2b826bc876a317c4
 +        let Some(t) = BLEND.with(Cell::get) else {
 +            return matrix;
 +        };
-+        let state = self.0.take();
++        let state = self.take();
 +        let previous = state.as_ref().and_then(|s| s.previous_at(frame()));
-+        self.0.set(state);
++        self.put(state);
 +        match previous {
 +            Some((previous, _, _)) => blend_matrix(&previous, &matrix, t),
 +            None => matrix,
@@ -6664,7 +7244,7 @@ index 0000000000000000000000000000000000000000..7a727594f155d81c2b826bc876a317c4
 +        let Some(t) = BLEND.with(Cell::get) else {
 +            return false;
 +        };
-+        let Some(mut state) = self.0.take() else {
++        let Some(mut state) = self.take() else {
 +            return false;
 +        };
 +        let mut changed = false;
@@ -6681,11 +7261,12 @@ index 0000000000000000000000000000000000000000..7a727594f155d81c2b826bc876a317c4
 +                    {
 +                        *filter = blended;
 +                        changed = true;
++                        note_blend();
 +                    }
 +                }
 +            }
 +        }
-+        self.0.set(Some(state));
++        self.put(Some(state));
 +        changed
 +    }
 +
@@ -6705,7 +7286,7 @@ index 0000000000000000000000000000000000000000..7a727594f155d81c2b826bc876a317c4
 +            return TweenRatio::Real(ratio);
 +        };
 +        let frame = frame();
-+        let mut state = self.0.take();
++        let mut state = self.take();
 +        let previous = state.as_ref().and_then(|s| s.previous_at(frame));
 +        // (Only if `blend` recorded it in this frame, at this ratio.)
 +        if let Some(s) = state.as_mut() {
@@ -6726,7 +7307,7 @@ index 0000000000000000000000000000000000000000..7a727594f155d81c2b826bc876a317c4
 +        let moved_from = state
 +            .as_ref()
 +            .and_then(|s| (s.frame == frame && s.ratio_changed == frame).then_some(s.ratio_from));
-+        self.0.set(state);
++        self.put(state);
 +        if let Some((from, p)) = held {
 +            let delta = (i32::from(ratio) - i32::from(from)).unsigned_abs();
 +            let steps = if delta == 0 { 1 } else { tween_steps(delta, travel_px) };
@@ -6994,6 +7575,29 @@ index 0000000000000000000000000000000000000000..7a727594f155d81c2b826bc876a317c4
 +                flags: to.flags,
 +            })
 +        }
++        (Filter::GradientGlowFilter(from), Filter::GradientGlowFilter(to))
++            if from.flags == to.flags
++                && from.colors.len() == to.colors.len()
++                && from.colors.iter().zip(&to.colors).all(|(a, b)| a.ratio == b.ratio) =>
++        {
++            Filter::GradientGlowFilter(swf::GradientFilter {
++                colors: from
++                    .colors
++                    .iter()
++                    .zip(&to.colors)
++                    .map(|(a, b)| swf::GradientRecord {
++                        ratio: b.ratio,
++                        color: lerp_rgba(a.color, b.color, t),
++                    })
++                    .collect(),
++                blur_x: lerp16(from.blur_x, to.blur_x, t),
++                blur_y: lerp16(from.blur_y, to.blur_y, t),
++                angle: lerp16(from.angle, to.angle, t),
++                distance: lerp16(from.distance, to.distance, t),
++                strength: lerp8(from.strength, to.strength, t),
++                flags: to.flags,
++            })
++        }
 +        _ => return None,
 +    })
 +}
@@ -7068,6 +7672,45 @@ index 0000000000000000000000000000000000000000..7a727594f155d81c2b826bc876a317c4
 +    }
 +
 +    use super::*;
++
++    /// The self-checks' dry walks: what a walk would draw now, read through the walk's own
++    /// copy of the trackers, and nothing left changed for the next real walk.
++    #[test]
++    fn a_dry_walk_blends_as_a_walk_and_changes_nothing() {
++        let at = |x: f64| Transform {
++            matrix: Matrix::translate(Twips::from_pixels(x), Twips::ZERO),
++            ..Default::default()
++        };
++        BLEND.with(|b| b.set(Some(0.5)));
++        FRAME.with(|f| f.set(1));
++        let (real, twin) = (Tracker::default(), Tracker::default());
++        real.blend(&mut at(10.0), 0);
++        twin.blend(&mut at(10.0), 0);
++        // In frame 2 it has moved: a dry walk blends it as a walk would, twice over.
++        FRAME.with(|f| f.set(2));
++        dry_begin();
++        let mut dry = at(30.0);
++        assert!(real.blend(&mut dry, 0).is_some());
++        let mut again = at(30.0);
++        real.blend(&mut again, 0);
++        assert!(dry.same(&again));
++        assert!(dry_states_len() > 0);
++        dry_end();
++        assert_eq!(dry_states_len(), 0);
++        // The real walk after it finds the tracker as the twin's, which no dry walk saw.
++        let (mut a, mut b) = (at(30.0), at(30.0));
++        assert_eq!(real.blend(&mut a, 0), twin.blend(&mut b, 0));
++        assert!(a.same(&b) && a.same(&dry));
++        // And in the next frame too.
++        FRAME.with(|f| f.set(3));
++        let (mut a, mut b) = (at(30.0), at(30.0));
++        assert_eq!(real.blend(&mut a, 0), twin.blend(&mut b, 0));
++        BLEND.with(|b| b.set(None));
++    }
++
++    fn dry_states_len() -> usize {
++        DRY_STATES.with_borrow(|states| states.len())
++    }
 +
 +    #[test]
 +    fn rotation_keeps_its_size() {
@@ -7396,7 +8039,7 @@ index 94b7ee8cae4f55aea3d5aa8b47b4129b4c9fd1db..a875ec43c92ac7a8d211df778de422f4
      }
  }
 diff --git a/core/src/display_object/morph_shape.rs b/core/src/display_object/morph_shape.rs
-index 8972325e2e8b14204a1683fae046903f067f36bd..527742cd1de7718b6f2a57ae3c0d87a0b64436e0 100644
+index 8972325e2e8b14204a1683fae046903f067f36bd..867e2ad13dcaf44aed8691ce806046f7173a6ea1 100644
 --- a/core/src/display_object/morph_shape.rs
 +++ b/core/src/display_object/morph_shape.rs
 @@ -1,6 +1,9 @@
@@ -7460,7 +8103,7 @@ index 8972325e2e8b14204a1683fae046903f067f36bd..527742cd1de7718b6f2a57ae3c0d87a0
              },
          ))
      }
-@@ -113,7 +140,56 @@ impl<'gc> TDisplayObject<'gc> for MorphShape<'gc> {
+@@ -113,7 +140,61 @@ impl<'gc> TDisplayObject<'gc> for MorphShape<'gc> {
      fn render_self(self, context: &mut RenderContext<'_, 'gc>) {
          let ratio = self.ratio();
          let shared = self.0.shared.get();
@@ -7473,6 +8116,11 @@ index 8972325e2e8b14204a1683fae046903f067f36bd..527742cd1de7718b6f2a57ae3c0d87a0
 +            let matrix = &context.transform_stack.transform().matrix;
 +            shared.travel_px_if_simple() * Measure::of(matrix).scale
 +        });
++        // (Drawn short of its real ratio: in between two frames. A cached picture drawn with it
++        // is drawn again, see `interp::note_blend`.)
++        if drawn != TweenRatio::Real(ratio) {
++            crate::display_object::interp::note_blend();
++        }
 +        if trace_tweens() {
 +            // (Testing: where each instance is drawn in each picture, to measure how evenly
 +            // it moves; see tools/exit-tests in the Mugetsu folder.)
@@ -7518,7 +8166,7 @@ index 8972325e2e8b14204a1683fae046903f067f36bd..527742cd1de7718b6f2a57ae3c0d87a0
          context
              .commands
              .render_shape(shape_handle, context.transform_stack.transform());
-@@ -184,10 +260,61 @@ impl<'gc> TDisplayObject<'gc> for MorphShape<'gc> {
+@@ -184,10 +265,61 @@ impl<'gc> TDisplayObject<'gc> for MorphShape<'gc> {
  }
  
  /// A precalculated intermediate frame for a morph shape.
@@ -7582,7 +8230,7 @@ index 8972325e2e8b14204a1683fae046903f067f36bd..527742cd1de7718b6f2a57ae3c0d87a0
  }
  
  /// Data shared between all instances of a morph shape.
-@@ -205,6 +332,29 @@ pub struct MorphShapeShared<'gc> {
+@@ -205,6 +337,29 @@ pub struct MorphShapeShared<'gc> {
  
      #[collect(require_static)]
      frames: RefCell<fnv::FnvHashMap<u16, Frame>>,
@@ -7612,7 +8260,7 @@ index 8972325e2e8b14204a1683fae046903f067f36bd..527742cd1de7718b6f2a57ae3c0d87a0
  }
  
  impl<'gc> MorphShapeShared<'gc> {
-@@ -214,6 +364,13 @@ impl<'gc> MorphShapeShared<'gc> {
+@@ -214,6 +369,13 @@ impl<'gc> MorphShapeShared<'gc> {
              start: swf_tag.start.clone(),
              end: swf_tag.end.clone(),
              frames: RefCell::new(fnv::FnvHashMap::default()),
@@ -7626,7 +8274,7 @@ index 8972325e2e8b14204a1683fae046903f067f36bd..527742cd1de7718b6f2a57ae3c0d87a0
              movie,
          }
      }
-@@ -231,17 +388,308 @@ impl<'gc> MorphShapeShared<'gc> {
+@@ -231,17 +393,308 @@ impl<'gc> MorphShapeShared<'gc> {
  
      /// Retrieves the `ShapeHandle` for the given ratio.
      /// Lazily initializes and tessellates the shape if it does not yet exist.
@@ -7848,7 +8496,13 @@ index 8972325e2e8b14204a1683fae046903f067f36bd..527742cd1de7718b6f2a57ae3c0d87a0
 +        let ms = work_ms(started, context.renderer.waited_micros() - waited);
 +        if ms <= SLOW_IN_BETWEEN_MS {
 +            self.slow_in_betweens.set(0);
-+        } else {
+         } else {
+-            let library = context.library.library_for_movie(self.movie).unwrap();
+-            let handle = context
+-                .renderer
+-                .register_shape((&frame.shape).into(), &MovieLibrarySource { library });
+-            frame.shape_handle = Some(handle.clone());
+-            handle
 +            let slow = self.slow_in_betweens.get() + 1;
 +            self.slow_in_betweens.set(slow);
 +            if slow >= SLOW_IN_BETWEENS {
@@ -7933,18 +8587,12 @@ index 8972325e2e8b14204a1683fae046903f067f36bd..527742cd1de7718b6f2a57ae3c0d87a0
 +    fn travel_px_if_simple(&self) -> f32 {
 +        if self.start.shape.len() <= SIMPLE_TWEEN_RECORDS {
 +            self.travel_px()
-         } else {
--            let library = context.library.library_for_movie(self.movie).unwrap();
--            let handle = context
--                .renderer
--                .register_shape((&frame.shape).into(), &MovieLibrarySource { library });
--            frame.shape_handle = Some(handle.clone());
--            handle
++        } else {
 +            0.0
          }
      }
  
-@@ -371,9 +819,10 @@ impl<'gc> MorphShapeShared<'gc> {
+@@ -371,9 +824,10 @@ impl<'gc> MorphShapeShared<'gc> {
          };
  
          Frame {
@@ -7957,7 +8605,7 @@ index 8972325e2e8b14204a1683fae046903f067f36bd..527742cd1de7718b6f2a57ae3c0d87a0
          }
      }
  
-@@ -401,6 +850,19 @@ impl<'gc> MorphShapeShared<'gc> {
+@@ -401,6 +855,19 @@ impl<'gc> MorphShapeShared<'gc> {
      }
  }
  
@@ -7977,7 +8625,7 @@ index 8972325e2e8b14204a1683fae046903f067f36bd..527742cd1de7718b6f2a57ae3c0d87a0
  // Interpolation functions
  // These interpolate between two SWF shape structures.
  // a + b should = 1.0
-@@ -641,4 +1103,88 @@ mod test {
+@@ -641,4 +1108,88 @@ mod test {
              Twips::new(-7)
          );
      }
@@ -9224,10 +9872,10 @@ index 0000000000000000000000000000000000000000..9d5e9dbc4af358495987c067f84e3ce7
 +}
 diff --git a/core/src/display_object/replay.rs b/core/src/display_object/replay.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..5aaa780a7f46cab70cb792c0b56da4e5f95ca487
+index 0000000000000000000000000000000000000000..29d135060a485c93a02369632166c22ae6f84dd8
 --- /dev/null
 +++ b/core/src/display_object/replay.rs
-@@ -0,0 +1,2093 @@
+@@ -0,0 +1,2372 @@
 +//! AQW build (Mugetsu): frame interpolation's in-between pictures, drawn without walking the
 +//! display list again.
 +//!
@@ -9238,7 +9886,8 @@ index 0000000000000000000000000000000000000000..5aaa780a7f46cab70cb792c0b56da4e5
 +//! `Recorder`); the next ones (`Program::replay`) only blend the moving objects' transforms
 +//! again, and draw a few kinds of objects again as the walk would ("islands": shape tweens,
 +//! text, cached layers, masked objects), as they depend on more than their transform. The
-+//! commands come out the same as a walk's (checked by comparing both while developing it).
++//! commands come out the same as a walk's: `RUFFLE_REPLAY_VERIFY` compares every replay with a
++//! walk (see `self_check`).
 +
 +use crate::context::RenderContext;
 +use crate::display_object::graphic::Graphic;
@@ -9264,6 +9913,19 @@ index 0000000000000000000000000000000000000000..5aaa780a7f46cab70cb792c0b56da4e5
 +thread_local! {
 +    /// Changes to display objects so far (anything that may change how they're drawn).
 +    static CHANGES: Cell<u64> = const { Cell::new(0) };
++    /// Objects hidden or taken off their parent so far (see `Saved::plan`).
++    static HIDES: Cell<u64> = const { Cell::new(0) };
++}
++
++/// Called when a display object is hidden, or taken off its parent: a replay must not draw it
++/// (or what's in it) as one of its islands (see `Saved::plan`).
++#[inline]
++pub fn hidden() {
++    HIDES.with(|c| c.set(c.get().wrapping_add(1)));
++}
++
++fn hides() -> u64 {
++    HIDES.with(Cell::get)
 +}
 +
 +/// Called whenever a display object changes in a way that may change how it's drawn.
@@ -9627,7 +10289,7 @@ index 0000000000000000000000000000000000000000..5aaa780a7f46cab70cb792c0b56da4e5
 +}
 +
 +/// What two lists of commands differ in, if anything.
-+fn difference(reused: &[Command], walked: &[Command]) -> Option<String> {
++pub(crate) fn difference(reused: &[Command], walked: &[Command]) -> Option<String> {
 +    fn same_debug<T: std::fmt::Debug>(a: &T, b: &T) -> bool {
 +        format!("{a:?}") == format!("{b:?}")
 +    }
@@ -9709,9 +10371,25 @@ index 0000000000000000000000000000000000000000..5aaa780a7f46cab70cb792c0b56da4e5
 +                        Command::RenderShape { shape: a, transform: ta },
 +                        Command::RenderShape { shape: b, transform: tb },
 +                    ) => format!(
-+                        " (the same tessellation: {}, the same transform: {})",
++                        " (the same tessellation: {} ({} and {}), the same transform: {}{})",
 +                        crate::tessellation_cache::made_alike(a, b),
-+                        ta.same(tb)
++                        crate::tessellation_cache::describe_tessellation(a),
++                        crate::tessellation_cache::describe_tessellation(b),
++                        ta.same(tb),
++                        transforms_apart(ta, tb)
++                    ),
++                    (
++                        Command::DrawRect { color: a, matrix: ma },
++                        Command::DrawRect { color: b, matrix: mb },
++                    ) => format!(" (colour {a:?} and {b:?}, the same matrix: {})", ma == mb),
++                    (
++                        Command::RenderBitmap { bitmap: a, transform: ta, .. },
++                        Command::RenderBitmap { bitmap: b, transform: tb, .. },
++                    ) => format!(
++                        " (the same bitmap: {}, the same transform: {}{})",
++                        a == b,
++                        ta.same(tb),
++                        transforms_apart(ta, tb)
 +                    ),
 +                    _ => String::new(),
 +                }
@@ -9725,6 +10403,23 @@ index 0000000000000000000000000000000000000000..5aaa780a7f46cab70cb792c0b56da4e5
 +            walked.len()
 +        )
 +    })
++}
++
++/// For the checks' reports: how two transforms differ (nothing if they don't).
++fn transforms_apart(a: &Transform, b: &Transform) -> String {
++    if a.same(b) {
++        return String::new();
++    }
++    let (ma, mb) = (&a.matrix, &b.matrix);
++    let mut out = format!(
++        ": [{} {} {} {} {:.2} {:.2}] and [{} {} {} {} {:.2} {:.2}] px",
++        ma.a, ma.b, ma.c, ma.d, ma.tx.to_pixels(), ma.ty.to_pixels(),
++        mb.a, mb.b, mb.c, mb.d, mb.tx.to_pixels(), mb.ty.to_pixels()
++    );
++    if a.color_transform != b.color_transform {
++        out.push_str(&format!("; colour {:?} and {:?}", a.color_transform, b.color_transform));
++    }
++    out
 +}
 +
 +/// For the perf log: pictures recorded, replayed, walked because recording wasn't possible,
@@ -9796,6 +10491,9 @@ index 0000000000000000000000000000000000000000..5aaa780a7f46cab70cb792c0b56da4e5
 +    /// Copied from an older recording: the objects below its node don't know their nodes in
 +    /// this one (they're told when the node's object is walked again).
 +    copied: bool,
++    /// Drawn with the usual options (what its parent's walk draws it with): the replay check
++    /// can walk it on its own (see `self_check`).
++    usual: bool,
 +}
 +
 +/// An object's transform in the recorded picture.
@@ -10436,6 +11134,7 @@ index 0000000000000000000000000000000000000000..5aaa780a7f46cab70cb792c0b56da4e5
 +            // (Settled in `pop_node`.)
 +            usable: self.lean && usual_options,
 +            copied: false,
++            usual: usual_options,
 +        };
 +        if moving {
 +            self.moving_nodes += 1;
@@ -10644,6 +11343,8 @@ index 0000000000000000000000000000000000000000..5aaa780a7f46cab70cb792c0b56da4e5
 +            replayable: true,
 +            scene: self.scene,
 +            commands: commands.commands.len() as u32,
++            clean: true,
++            recorded_hides: 0,
 +        })
 +    }
 +}
@@ -10764,6 +11465,12 @@ index 0000000000000000000000000000000000000000..5aaa780a7f46cab70cb792c0b56da4e5
 +    /// How many commands its picture had.
 +    #[collect(require_static)]
 +    commands: u32,
++    /// The replay check: whether nothing has changed between any two of its pictures (the
++    /// recording's and the replays'), and `hides()` when it was recorded.
++    #[collect(require_static)]
++    clean: bool,
++    #[collect(require_static)]
++    recorded_hides: u64,
 +}
 +
 +impl<'gc> Program<'gc> {
@@ -10805,12 +11512,200 @@ index 0000000000000000000000000000000000000000..5aaa780a7f46cab70cb792c0b56da4e5
 +        }
 +        let drawn = Drawn {
 +            nodes: &self.nodes,
-+            drawn: &self.drawn,
++            // (`RUFFLE_REPLAY_VERIFY_FAULT`, testing the check: the moving objects are drawn
++            // where they were recorded.)
++            drawn: if crate::display_object::self_check::replay_fault() {
++                &[]
++            } else {
++                &self.drawn
++            },
 +            fresh: false,
 +        };
 +        run(&self.ops, &self.objects, &drawn, context)
 +    }
++
++    /// Whether an object it draws again by itself (an island, a drawing) was hidden, or taken
++    /// off the stage, since it was recorded (it, or an object it's in): a walk wouldn't draw
++    /// it. Only asked about a picture that would replay a change left for the next frame, and
++    /// only when something was hidden since the recording.
++    fn islands_hidden(&self) -> bool {
++        if hides() == self.recorded_hides || crate::display_object::self_check::fault_as_201() {
++            return false;
++        }
++        self.objects.iter().any(|&object| {
++            let mut at = Some(object);
++            while let Some(o) = at {
++                // (A mask is drawn hidden or not.)
++                if !o.visible() && o.clip_depth() <= 0 {
++                    return true;
++                }
++                if o.as_stage().is_some() {
++                    return false;
++                }
++                at = o.parent();
++            }
++            true
++        })
++    }
++
++    /// `RUFFLE_REPLAY_VERIFY` (see `self_check`): the stage is walked as well (dry), and the
++    /// picture just replayed (`replayed`) compared with it: all of it while nothing has changed
++    /// since the recording, the branches that haven't changed otherwise.
++    fn verify(
++        &self,
++        context: &mut RenderContext<'_, 'gc>,
++        replayed: &CommandList,
++        walk: &mut impl FnMut(&mut RenderContext<'_, 'gc>),
++    ) {
++        use crate::display_object::self_check;
++        interp::dry_begin();
++        let picture = std::mem::take(&mut context.commands);
++        walk(context);
++        let walked = std::mem::replace(&mut context.commands, picture);
++        let drawn = Drawn {
++            nodes: &self.nodes,
++            // (As the replay drew them, the fault included.)
++            drawn: if self_check::replay_fault() { &[] } else { &self.drawn },
++            fresh: false,
++        };
++        let by_node =
++            !self.node_objects.is_empty() && self.node_objects.len() == self.nodes.len();
++        if self.clean {
++            if let Some(what) = difference(&replayed.commands, &walked.commands) {
++                let deepest = if by_node {
++                    let mut deepest = None;
++                    for root in self.roots() {
++                        if self.branch_differs(context, &drawn, root).is_some() {
++                            deepest = Some(self.deepest(context, &drawn, root));
++                            break;
++                        }
++                    }
++                    deepest.map_or_else(
++                        || "none of its branches (only what's outside them)".to_string(),
++                        |n| self_check::where_is(self.node_objects[n as usize]),
++                    )
++                } else {
++                    "not known (recorded without lean render)".to_string()
++                };
++                self_check::replay_found(format!(
++                    "a replayed picture is not what a walk draws, though nothing changed since it was recorded: {what}; the deepest branch that differs: {deepest}"
++                ));
++            }
++            self_check::replay_compared(true, 0);
++        } else if by_node && lean_tracking() {
++            let mut compared = 0;
++            for root in self.roots() {
++                self.compare_unchanged(context, &drawn, root, &mut compared);
++            }
++            self_check::replay_compared(false, compared);
++        }
++        interp::dry_end();
++    }
++
++    /// The nodes outside any other.
++    fn roots(&self) -> Vec<u32> {
++        self.children_in(0, self.nodes.len() as u32)
++    }
++
++    /// The nodes right inside node `node`.
++    fn children(&self, node: u32) -> Vec<u32> {
++        let end = self.nodes[node as usize]
++            .seg
++            .nodes_end
++            .min(self.nodes.len() as u32);
++        self.children_in(node + 1, end)
++    }
++
++    fn children_in(&self, mut node: u32, end: u32) -> Vec<u32> {
++        let mut found = Vec::new();
++        while node < end {
++            found.push(node);
++            node = self.nodes[node as usize].seg.nodes_end.max(node + 1);
++        }
++        found
++    }
++
++    /// The replay check: whether the branch of node `node`, drawn as the replay drew it, is
++    /// what a walk of it draws (inside its parent's transform in the replay), and if not, how.
++    fn branch_differs(
++        &self,
++        context: &mut RenderContext<'_, 'gc>,
++        drawn: &Drawn<'_>,
++        node: u32,
++    ) -> Option<String> {
++        let here = &self.nodes[node as usize];
++        let seg = here.seg;
++        if !seg.usual {
++            return None;
++        }
++        let ops = self
++            .list(seg.list)
++            .get(seg.ops.0 as usize..seg.ops.1 as usize)?;
++        let picture = std::mem::take(&mut context.commands);
++        context.commands.set_maskers(seg.maskers);
++        let result = run(ops, &self.objects, drawn, context);
++        let replayed = std::mem::take(&mut context.commands);
++        context.commands.set_maskers(seg.maskers);
++        let outer = match &here.outer {
++            Some(outer) => (**outer).clone(),
++            None if here.parent != NONE => drawn.get(here.parent).clone(),
++            None => Transform::default(),
++        };
++        context.transform_stack.push_absolute(&outer);
++        render_base(
++            self.node_objects[node as usize],
++            context,
++            RenderOptions::default(),
++        );
++        context.transform_stack.pop();
++        let walked = std::mem::replace(&mut context.commands, picture);
++        match result {
++            Err(why) => Some(format!("drawing it again gave up: {why}")),
++            Ok(()) => difference(&replayed.commands, &walked.commands),
++        }
++    }
++
++    /// The deepest node in the branch of `node` (which differs) whose own branch differs.
++    fn deepest(&self, context: &mut RenderContext<'_, 'gc>, drawn: &Drawn<'_>, node: u32) -> u32 {
++        for child in self.children(node) {
++            if self.branch_differs(context, drawn, child).is_some() {
++                return self.deepest(context, drawn, child);
++            }
++        }
++        node
++    }
++
++    /// The replay check after a change: the branches of the recording that didn't change since
++    /// it was begun (lean render's marks), from `node` down, each compared as a whole.
++    fn compare_unchanged(
++        &self,
++        context: &mut RenderContext<'_, 'gc>,
++        drawn: &Drawn<'_>,
++        node: u32,
++        compared: &mut u64,
++    ) {
++        let object = self.node_objects[node as usize];
++        let seg = self.nodes[node as usize].seg;
++        if seg.usual && !object.base().render_note.changed_since(self.generation) {
++            *compared += 1;
++            if let Some(what) = self.branch_differs(context, drawn, node) {
++                let deepest = self.deepest(context, drawn, node);
++                crate::display_object::self_check::replay_found(format!(
++                    "a branch that did not change since the recording was replayed otherwise than a walk draws it: {}: {what}; the deepest branch that differs: {}",
++                    crate::display_object::self_check::path_of(object),
++                    crate::display_object::self_check::where_is(
++                        self.node_objects[deepest as usize]
++                    ),
++                ));
++            }
++            return;
++        }
++        for child in self.children(node) {
++            self.compare_unchanged(context, drawn, child, compared);
++        }
++    }
 +}
++
 +
 +struct Drawn<'a> {
 +    nodes: &'a [Node],
@@ -10914,7 +11809,23 @@ index 0000000000000000000000000000000000000000..5aaa780a7f46cab70cb792c0b56da4e5
 +                let saved = context.commands.maskers();
 +                context.commands.set_maskers(*maskers);
 +                context.transform_stack.push_absolute(drawn.get(*node));
-+                render_base(objects[*object as usize], context, options.clone());
++                // As a walk does before it draws an object (`pre_render`): its "cache
++                // invalidated" flag is cleared. A change since the last walk set it, and a
++                // cached island drawn here redraws its cache; with the flag left set, the
++                // next change returned early from `invalidate_cached_bitmap` without making
++                // the cache dirty, so that change was never drawn. Where nothing walks the
++                // object before that change (its parent hidden by then: AQW's target box,
++                // hidden as the target died), it stayed so: the box kept showing HP and MP
++                // "0" for the next target.
++                let island = objects[*object as usize];
++                // (Not in a self-check's dry walk, which changes nothing; nor with the fault
++                // the cache check is tested with, see `self_check::cache_fault`.)
++                if !crate::display_object::interp::dry()
++                    && !crate::display_object::self_check::cache_fault()
++                {
++                    island.base().clear_invalidate_flag();
++                }
++                render_base(island, context, options.clone());
 +                context.transform_stack.pop();
 +                context.commands.set_maskers(saved);
 +            }
@@ -11003,6 +11914,12 @@ index 0000000000000000000000000000000000000000..5aaa780a7f46cab70cb792c0b56da4e5
 +    /// a crowded town instead of 150, each ~5 ms). The program is still good to draw from:
 +    /// it draws the picture as it was, and what's drawn again in every picture (text, cached
 +    /// and masked objects, shape tweens: that glow too) is drawn as it is now.
++    ///
++    /// Except an island that was hidden, or taken off the stage (it or an object it's in), since
++    /// the recording: a walk doesn't draw it, and a replay drew it as it is now for up to a
++    /// frame, without the walk's bookkeeping (AQW's target box, hidden as the target dies, kept
++    /// its numbers on screen and redrew them). That change is walked at once
++    /// (`Program::islands_hidden`; only looked into when something was hidden since).
 +    pub fn plan(&mut self, redraw_asked: bool) -> Plan<'gc> {
 +        let lean = lean_tracking();
 +        if !ENABLED.load(Ordering::Relaxed) || (interp::amount().is_none() && !lean) {
@@ -11031,7 +11948,11 @@ index 0000000000000000000000000000000000000000..5aaa780a7f46cab70cb792c0b56da4e5
 +            Some(program) if program.key == now && program.replayable => Plan::Replay(program),
 +            Some(program) => {
 +                if program.key.frame == now.frame && program.replayable {
-+                    if !redraw_asked && program.key.edge_mode == now.edge_mode && !eager() {
++                    if !redraw_asked
++                        && program.key.edge_mode == now.edge_mode
++                        && !eager()
++                        && !program.islands_hidden()
++                    {
 +                        count(LEFT_FOR_NEXT_FRAME);
 +                        return Plan::Replay(program);
 +                    }
@@ -11048,15 +11969,20 @@ index 0000000000000000000000000000000000000000..5aaa780a7f46cab70cb792c0b56da4e5
 +        &mut self,
 +        mut program: Program<'gc>,
 +        context: &mut RenderContext<'_, 'gc>,
-+        walk: impl FnOnce(&mut RenderContext<'_, 'gc>),
++        mut walk: impl FnMut(&mut RenderContext<'_, 'gc>),
 +    ) {
 +        let t = interp::amount().unwrap_or(1.0);
++        // (Its key holds `changes()` as the last picture left it.)
++        program.clean &= program.key.changes == changes();
 +        let outer = std::mem::take(&mut context.commands);
 +        let result = program.replay(context, t);
 +        let replayed = std::mem::replace(&mut context.commands, outer);
 +        match result {
 +            Ok(()) => {
 +                count(REPLAYED);
++                if crate::display_object::self_check::replay_verify() {
++                    program.verify(context, &replayed, &mut walk);
++                }
 +                context.commands = replayed;
 +            }
 +            Err(why) => {
@@ -11091,6 +12017,7 @@ index 0000000000000000000000000000000000000000..5aaa780a7f46cab70cb792c0b56da4e5
 +                }
 +                program.replayable = replayable;
 +                program.key = Key::now();
++                program.recorded_hides = hides();
 +                self.0 = Some(program);
 +            }
 +            Err(why) => {
@@ -11320,6 +12247,509 @@ index 0000000000000000000000000000000000000000..5aaa780a7f46cab70cb792c0b56da4e5
 +            .is_some()
 +        );
 +    }
++}
+diff --git a/core/src/display_object/self_check.rs b/core/src/display_object/self_check.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..41e2be80726627955c1059be2b50f2b36bdc4c7e
+--- /dev/null
++++ b/core/src/display_object/self_check.rs
+@@ -0,0 +1,497 @@
++//! AQW build (Mugetsu): self-checks of the pictures the shortcuts keep, off unless switched on
++//! (for tests, and for a player to send a log with). Both cost nothing while off: a switch
++//! read once, and a flag the trackers ask (`interp::dry`).
++//!
++//! `RUFFLE_CACHE_VERIFY` (a `cache-verify` file next to the exe; `=panic` panics, for tests):
++//! a cached object (cacheAsBitmap, filters) keeps its picture until something invalidates it.
++//! Whenever its picture is drawn, what it was drawn from is kept: the commands of its contents
++//! (with the transform they were drawn inside), the filters it was drawn with, its background,
++//! and the version of every cached object's picture drawn into it. Once per SWF frame, when the
++//! object is drawn from its kept picture (not dirty, not waiting for shapes), its contents are
++//! walked again inside that same transform without drawing or changing anything (a dry walk:
++//! the trackers are read through a copy, no cache is drawn or marked, no flag is cleared), and
++//! the commands compared as lean render's check compares them (the same tessellation or one of
++//! the same shape, a stand-in included; the same transform, bitmap and blend). The picture is
++//! stale when they differ, when its filters or background do, when a cached object drawn into
++//! it was drawn again since, or would be now (it's dirty). A difference that lasts for 3 checks
++//! in 3 SWF frames is reported ("CACHE VERIFY: stale picture") with the object's path, its
++//! movie, what differs and for how long; a shorter one is not (a change between two frames is
++//! drawn with the next frame's picture at the latest). Pictures kept on purpose are not
++//! checked: an object waiting for its shapes keeps its last picture until they're done (see
++//! `deferred_shapes`), and one whose contents (or a cached object in them) can't be told is
++//! skipped (drawn for the first time, too big to cache). Not compared: a bitmap's pixels (only
++//! which bitmap), and the scroll rects of the objects inside, which a walk takes up in
++//! `pre_render` (left alone by the dry walk). Cost while on: one dry walk per cached object
++//! drawn from its picture per SWF frame, and a copy of the commands of every picture drawn.
++//!
++//! `RUFFLE_REPLAY_VERIFY` (a `replay-verify` file; `=panic`): every picture replayed from a
++//! recording (frame interpolation's in-between pictures, see `replay`) is walked as well (dry),
++//! and the two lists of commands compared. A replay promises the picture as it was recorded,
++//! with the moving objects' transforms blended for the picture's time, and the islands (text,
++//! cached and masked objects, shape tweens, 9-slice shapes) drawn as they are now. So:
++//! - while nothing has changed between any two of its pictures (the recording's and the
++//!   replays'), the whole picture must be what a walk draws;
++//! - after a change between two frames without a redraw request (left for the next frame on
++//!   purpose, see `Saved::plan`), every branch of the recording whose objects didn't change
++//!   since it was begun (lean render's marks tell; without lean render nothing is compared
++//!   then) must be what a walk of that branch draws inside its parent's transform in the
++//!   replay. A changed branch is looked into for unchanged branches below it.
++//! A difference is reported ("REPLAY VERIFY") with the deepest branch that differs. Cost while
++//! on: a dry walk of the stage per replayed picture.
++//!
++//! `RUFFLE_CACHE_VERIFY_FAULT` and `RUFFLE_REPLAY_VERIFY_FAULT` break what each check is
++//! about on purpose, to see that it reports it (testing the tests).
++
++use crate::display_object::{DisplayObject, TDisplayObject};
++use ruffle_render::bitmap::{BitmapHandle, BitmapHandleImpl};
++use ruffle_render::commands::Command;
++use ruffle_render::filters::Filter;
++use ruffle_render::transform::Transform;
++use std::cell::{Cell, RefCell};
++use std::collections::HashMap;
++use std::sync::OnceLock;
++use std::sync::Weak;
++use swf::Color;
++use web_time::Instant;
++
++fn switch(cell: &'static OnceLock<bool>, name: &str) -> bool {
++    *cell.get_or_init(|| std::env::var_os(name).is_some())
++}
++
++fn panics(name: &str) -> bool {
++    std::env::var_os(name).is_some_and(|v| v == "panic")
++}
++
++pub fn cache_verify() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    switch(&ON, "RUFFLE_CACHE_VERIFY")
++}
++
++pub fn replay_verify() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    switch(&ON, "RUFFLE_REPLAY_VERIFY")
++}
++
++/// `RUFFLE_CACHE_VERIFY_FAULT` (testing the test): a replay draws its islands as 2.0.1 did,
++/// without clearing their "cache invalidated" flag, so a change of a cached one can be lost.
++/// Unless it's `=flag`, the rest is as in 2.0.1 too (`fault_as_201`): islands hidden since
++/// the recording are drawn, and cached pictures drawn in between two frames are not drawn
++/// again. Only with `RUFFLE_CACHE_VERIFY`, to see that it's reported.
++pub fn cache_fault() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    cache_verify() && switch(&ON, "RUFFLE_CACHE_VERIFY_FAULT")
++}
++
++/// See `cache_fault`.
++pub fn fault_as_201() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    cache_fault()
++        && *ON.get_or_init(|| {
++            std::env::var_os("RUFFLE_CACHE_VERIFY_FAULT").is_some_and(|v| v != "flag")
++        })
++}
++
++/// `RUFFLE_REPLAY_VERIFY_FAULT` (testing the test): a replay draws the moving objects where
++/// they were recorded instead of blending them. Only with `RUFFLE_REPLAY_VERIFY`.
++pub fn replay_fault() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    replay_verify() && switch(&ON, "RUFFLE_REPLAY_VERIFY_FAULT")
++}
++
++/// Either check (they need to know which tessellations are of one shape, see
++/// `tessellation_cache::made_alike`).
++pub fn any() -> bool {
++    cache_verify() || replay_verify()
++}
++
++/// Checks, then reports: once per SWF frame per object; reported when stale this long.
++const STALE_CHECKS: u32 = 3;
++const STALE_FRAMES: u64 = 2;
++/// Reports logged in full (the counts go on).
++const LOGGED: u64 = 40;
++
++/// What a cached object's picture was drawn from (see the module docs).
++pub struct Picture {
++    /// The transform its contents were drawn inside.
++    root: Transform,
++    commands: Vec<Command>,
++    /// The versions of the cached objects' pictures it drew, in the order of its bitmaps.
++    nested: Vec<Option<u64>>,
++    filters: Vec<Filter>,
++    clear: Color,
++    /// The SWF frame it was last checked in.
++    checked: u64,
++    /// Since when it's been stale: the frame, the time, and how many checks found it so.
++    stale: Option<(u64, Instant, u32)>,
++    reported: bool,
++}
++
++/// Kept with a cached object's `BitmapCache` (empty while the check is off; a copy starts
++/// empty).
++#[derive(Default)]
++pub struct Slot(Option<Box<Picture>>);
++
++impl Clone for Slot {
++    fn clone(&self) -> Self {
++        Self::default()
++    }
++}
++
++impl std::fmt::Debug for Slot {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.write_str(if self.0.is_some() {
++            "Slot(kept)"
++        } else {
++            "Slot"
++        })
++    }
++}
++
++thread_local! {
++    /// The version of each cached object's picture (by its texture's address): how many times
++    /// it was drawn. (The weak pointer keeps the address from being given to another texture
++    /// while its entry is here.)
++    static VERSIONS: RefCell<HashMap<usize, (Weak<dyn BitmapHandleImpl>, u64)>> =
++        RefCell::new(HashMap::new());
++    static NEXT_PRUNE: Cell<usize> = const { Cell::new(4096) };
++    /// During a dry walk: the cached objects in it that a walk would draw again now.
++    static WOULD_REDRAW: RefCell<HashMap<usize, String>> = RefCell::new(HashMap::new());
++    /// During a dry walk: why it can't tell what a walk would draw.
++    static UNSURE: Cell<Option<&'static str>> = const { Cell::new(None) };
++    static STATS: Cell<Stats> = const { Cell::new(Stats { checks: 0, stored: 0, unsure: 0, waiting: 0, found: 0, replays: 0, whole: 0, by_branch: 0, branches: 0, replay_found: 0, frames: 0 }) };
++}
++
++#[derive(Clone, Copy)]
++struct Stats {
++    checks: u64,
++    stored: u64,
++    unsure: u64,
++    waiting: u64,
++    found: u64,
++    replays: u64,
++    whole: u64,
++    by_branch: u64,
++    branches: u64,
++    replay_found: u64,
++    frames: u64,
++}
++
++fn stats(change: impl FnOnce(&mut Stats)) -> Stats {
++    STATS.with(|s| {
++        let mut stats = s.get();
++        change(&mut stats);
++        s.set(stats);
++        stats
++    })
++}
++
++fn address(handle: &BitmapHandle) -> usize {
++    std::sync::Arc::as_ptr(&handle.0) as *const () as usize
++}
++
++fn version(handle: &BitmapHandle) -> Option<u64> {
++    VERSIONS.with_borrow(|v| v.get(&address(handle)).map(|entry| entry.1))
++}
++
++fn bitmaps<'a>(commands: &'a [Command], out: &mut Vec<&'a BitmapHandle>) {
++    for command in commands {
++        match command {
++            Command::RenderBitmap { bitmap, .. } | Command::RenderStage3D { bitmap, .. } => {
++                out.push(bitmap)
++            }
++            Command::RenderAlphaMask {
++                maskee_commands,
++                mask_commands,
++            } => {
++                bitmaps(&maskee_commands.commands, out);
++                bitmaps(&mask_commands.commands, out);
++            }
++            Command::Blend(list, _) => bitmaps(&list.commands, out),
++            _ => {}
++        }
++    }
++}
++
++/// A cached object's picture is drawn (into `handle`) from `commands`, inside `root`, with
++/// `filters`, on `clear`: it's kept, and the picture's version goes up.
++pub(crate) fn drawn(
++    slot: &mut Slot,
++    handle: &BitmapHandle,
++    root: Transform,
++    commands: &[Command],
++    filters: &[Filter],
++    clear: Color,
++) {
++    let mut drawn_into = Vec::new();
++    bitmaps(commands, &mut drawn_into);
++    let nested = drawn_into.into_iter().map(version).collect();
++    VERSIONS.with_borrow_mut(|versions| {
++        if versions.len() >= NEXT_PRUNE.with(Cell::get) {
++            versions.retain(|_, entry| entry.0.strong_count() > 0);
++            NEXT_PRUNE.with(|next| next.set((versions.len() * 2).max(4096)));
++        }
++        let entry = versions
++            .entry(address(handle))
++            .or_insert_with(|| (std::sync::Arc::downgrade(&handle.0), 0));
++        entry.1 += 1;
++    });
++    stats(|s| s.stored += 1);
++    slot.0 = Some(Box::new(Picture {
++        root,
++        commands: commands.to_vec(),
++        nested,
++        filters: filters.to_vec(),
++        clear,
++        checked: 0,
++        stale: None,
++        reported: false,
++    }));
++}
++
++/// The cached object is drawn from its kept picture: whether it's checked now (once per SWF
++/// frame), and the transform to walk its contents inside.
++pub(crate) fn due(slot: &mut Slot) -> Option<Transform> {
++    let picture = slot.0.as_mut()?;
++    let frame = crate::display_object::interp::frame();
++    if picture.checked == frame {
++        return None;
++    }
++    picture.checked = frame;
++    Some(picture.root.clone())
++}
++
++/// The cached object is waiting for shapes: it keeps its last picture on purpose.
++pub(crate) fn waiting() {
++    stats(|s| s.waiting += 1);
++}
++
++/// A dry walk of a cached object's contents begins (`dry_result` ends it).
++pub(crate) fn dry_scope() {
++    WOULD_REDRAW.with_borrow_mut(HashMap::clear);
++    UNSURE.with(|u| u.set(None));
++}
++
++/// In a dry walk: a cached object (`object`, drawn into `handle`) would be drawn again now, and
++/// why; `None`: it would get its first picture, or a new texture.
++pub(crate) fn would_redraw(object: DisplayObject<'_>, handle: Option<&BitmapHandle>, why: &str) {
++    match handle {
++        Some(handle) => {
++            let what = format!("{} ({why})", describe(object));
++            WOULD_REDRAW.with_borrow_mut(|map| map.insert(address(handle), what));
++        }
++        None => unsure("a cached object in it would be drawn for the first time"),
++    }
++}
++
++/// In a dry walk: something it can't tell.
++pub(crate) fn unsure(why: &'static str) {
++    UNSURE.with(|u| {
++        if u.get().is_none() {
++            u.set(Some(why));
++        }
++    });
++}
++
++fn describe(object: DisplayObject<'_>) -> String {
++    let kind = match object {
++        DisplayObject::Stage(_) => "stage",
++        DisplayObject::Bitmap(_) => "bitmap",
++        DisplayObject::Avm1Button(_) => "AVM1 button",
++        DisplayObject::Avm2Button(_) => "button",
++        DisplayObject::EditText(_) => "text field",
++        DisplayObject::TextLine(_) => "text line",
++        DisplayObject::Graphic(_) => "shape",
++        DisplayObject::MorphShape(_) => "shape tween",
++        DisplayObject::MovieClip(_) => "clip",
++        DisplayObject::Text(_) => "text",
++        DisplayObject::Video(_) => "video",
++        DisplayObject::LoaderDisplay(_) => "loader",
++    };
++    let name = object.name().map(|n| n.to_string()).unwrap_or_default();
++    format!("{kind} {} {name:?}", object.id())
++}
++
++/// Where an object is: its ancestors and itself, from the stage down.
++pub(crate) fn path_of(object: DisplayObject<'_>) -> String {
++    let mut path = String::new();
++    let mut at = Some(object);
++    let mut depth = 0;
++    while let Some(o) = at {
++        path = format!("/{}{path}", describe(o));
++        at = o.parent();
++        depth += 1;
++        if depth > 64 {
++            path = format!("...{path}");
++            break;
++        }
++    }
++    path
++}
++
++fn url_of(object: DisplayObject<'_>) -> String {
++    object.movie().url().to_string()
++}
++
++/// `path_of`, with the object's movie.
++pub(crate) fn where_is(object: DisplayObject<'_>) -> String {
++    format!("{} (in {})", path_of(object), url_of(object))
++}
++
++/// The dry walk of the contents of `object` (kept in `slot`) gave `now`, with `filters` and
++/// `clear` as they are now: compared with what its picture was drawn from.
++pub(crate) fn judge(
++    object: DisplayObject<'_>,
++    slot: &mut Slot,
++    now: &[Command],
++    filters: &[Filter],
++    clear: Color,
++) {
++    let unsure_why = UNSURE.with(|u| u.take());
++    let would_redraw = WOULD_REDRAW.with_borrow_mut(std::mem::take);
++    let Some(picture) = slot.0.as_mut() else {
++        return;
++    };
++    if unsure_why.is_some() {
++        stats(|s| s.unsure += 1);
++        return;
++    }
++    stats(|s| s.checks += 1);
++    let mut what = super::replay::difference(&picture.commands, now);
++    // (A shader filter's image inputs compare by where the copy is: told apart by how they
++    // print.)
++    if what.is_none()
++        && picture.filters != filters
++        && format!("{:?}", picture.filters) != format!("{filters:?}")
++    {
++        let short = |filters: &[Filter]| -> String {
++            let text = format!("{filters:?}");
++            text.chars().take(300).collect()
++        };
++        what = Some(format!(
++            "its filters were {} and are {} now",
++            short(&picture.filters),
++            short(filters)
++        ));
++    }
++    if what.is_none() && picture.clear != clear {
++        what = Some("its background colour changed".to_string());
++    }
++    if what.is_none() {
++        let mut drawn_into = Vec::new();
++        bitmaps(now, &mut drawn_into);
++        for (index, (handle, then)) in drawn_into.iter().zip(&picture.nested).enumerate() {
++            let current = version(handle);
++            if *then != current {
++                what = Some(format!(
++                    "the cached object drawn as its bitmap {index} was drawn again since (picture {then:?}, now {current:?})"
++                ));
++                break;
++            }
++            if let Some(which) = would_redraw.get(&address(handle)) {
++                what = Some(format!(
++                    "the cached object drawn as its bitmap {index}, {which}, would be drawn again now: its own picture is out of date"
++                ));
++                break;
++            }
++        }
++    }
++    let frame = crate::display_object::interp::frame();
++    let Some(what) = what else {
++        if picture.reported {
++            tracing::warn!(
++                target: "ruffle_aqw_perf",
++                "CACHE VERIFY: the picture of {} is right again",
++                path_of(object)
++            );
++        }
++        picture.stale = None;
++        picture.reported = false;
++        return;
++    };
++    let (since, at, checks) = picture.stale.get_or_insert((frame, Instant::now(), 0));
++    *checks += 1;
++    if picture.reported || *checks < STALE_CHECKS || frame - *since < STALE_FRAMES {
++        return;
++    }
++    picture.reported = true;
++    let message = format!(
++        "CACHE VERIFY: stale picture: {} (in {}) was drawn from its kept picture, but {what}; so for {} checks, {} SWF frames, {:.0} ms",
++        path_of(object),
++        url_of(object),
++        checks,
++        frame - *since,
++        at.elapsed().as_secs_f64() * 1000.0
++    );
++    let found = stats(|s| s.found += 1).found;
++    if found <= LOGGED {
++        tracing::warn!(target: "ruffle_aqw_perf", "{message}");
++    }
++    if panics("RUFFLE_CACHE_VERIFY") {
++        panic!("{message}");
++    }
++}
++
++/// The replay check: a replay compared with a walk, as a whole (`whole`) or by its unchanged
++/// branches (`branches` of them).
++pub(crate) fn replay_compared(whole: bool, branches: u64) {
++    stats(|s| {
++        s.replays += 1;
++        if whole {
++            s.whole += 1;
++        } else {
++            s.by_branch += 1;
++        }
++        s.branches += branches;
++    });
++}
++
++pub(crate) fn replay_found(message: String) {
++    let found = stats(|s| s.replay_found += 1).replay_found;
++    let message = format!("REPLAY VERIFY: {message}");
++    if found <= LOGGED {
++        tracing::warn!(target: "ruffle_aqw_perf", "{message}");
++    }
++    if panics("RUFFLE_REPLAY_VERIFY") {
++        panic!("{message}");
++    }
++}
++
++/// Called when a frame's walks are done: a line in the log now and then.
++pub fn frame_done() {
++    if !any() {
++        return;
++    }
++    let s = stats(|s| s.frames += 1);
++    if s.frames < 150 {
++        return;
++    }
++    if cache_verify() {
++        tracing::info!(
++            target: "ruffle_aqw_perf",
++            "cache verify: {} pictures kept, {} checks, {} not told (a cached object inside drawn for the first time), {} waiting for shapes, in {} frames; {} stale found in all",
++            s.stored, s.checks, s.unsure, s.waiting, s.frames, s.found
++        );
++    }
++    if replay_verify() {
++        tracing::info!(
++            target: "ruffle_aqw_perf",
++            "replay verify: {} replays compared in {} frames ({} whole, {} by {} unchanged branches); {} found in all",
++            s.replays, s.frames, s.whole, s.by_branch, s.branches, s.replay_found
++        );
++    }
++    STATS.with(|st| {
++        st.set(Stats {
++            found: s.found,
++            replay_found: s.replay_found,
++            checks: 0,
++            stored: 0,
++            unsure: 0,
++            waiting: 0,
++            replays: 0,
++            whole: 0,
++            by_branch: 0,
++            branches: 0,
++            frames: 0,
++        })
++    });
 +}
 diff --git a/core/src/display_object/stage.rs b/core/src/display_object/stage.rs
 index 3c73b541bd4b2d60ce3ab2b35825d29f02621eb4..8233eaa8f874f19184fd6751814fd11f2927fd12 100644
@@ -12783,7 +14213,7 @@ index 33adb41c563bc1990adab53f93826507a8653ded..1c1cc5cc8971d3ff3399ba37cfa031dd
              let movie = movie.unwrap();
              let flashvars = movie.parameters();
 diff --git a/core/src/player.rs b/core/src/player.rs
-index fce1e4dc01664b33e6592de7a176f5715f6785e1..88361f4f69f9b3a27e577d7caaa2d7b8d7d2d25e 100644
+index fce1e4dc01664b33e6592de7a176f5715f6785e1..9299b42fc8b97dcaea6547ce9d5e9e076b8debba 100644
 --- a/core/src/player.rs
 +++ b/core/src/player.rs
 @@ -145,6 +145,13 @@ pub struct MouseData<'gc> {
@@ -13168,11 +14598,13 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..88361f4f69f9b3a27e577d7caaa2d7b8
          let frame_time = self.frame_time(750_000_000.0);
          let frame_time = Duration::from_nanos(frame_time as u64);
          let (mut execution_limit, may_execute_while_streaming) = match self.load_behavior {
-@@ -2026,10 +2290,21 @@ impl Player {
+@@ -2026,10 +2290,23 @@ impl Player {
          });
  
          self.needs_render = true;
 +        crate::display_object::interp::frame_finished();
++        // AQW build: the self-checks' counts, now and then (see `self_check`).
++        crate::display_object::self_check::frame_done();
      }
  
      #[instrument(level = "debug", skip_all)]
@@ -13190,7 +14622,7 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..88361f4f69f9b3a27e577d7caaa2d7b8
          let invalidated = self.enter_arena(|_, gc_root, _| gc_root.stage.invalidated());
  
          if invalidated {
-@@ -2038,14 +2313,35 @@ impl Player {
+@@ -2038,14 +2315,35 @@ impl Player {
                  stage.broadcast_render(context);
              });
          }
@@ -13226,7 +14658,7 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..88361f4f69f9b3a27e577d7caaa2d7b8
                  renderer: this.renderer.deref_mut(),
                  commands: CommandList::new(),
                  cache_draws: &mut cache_draws,
-@@ -2058,7 +2354,23 @@ impl Player {
+@@ -2058,7 +2356,23 @@ impl Player {
                  stage,
              };
  
@@ -13251,7 +14683,7 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..88361f4f69f9b3a27e577d7caaa2d7b8
  
              #[cfg(feature = "egui")]
              {
-@@ -2067,6 +2379,13 @@ impl Player {
+@@ -2067,6 +2381,13 @@ impl Player {
                      .draw_debug_rects(&mut render_context, gc_root.dynamic_root);
              }
  
@@ -13265,7 +14697,7 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..88361f4f69f9b3a27e577d7caaa2d7b8
              background_color =
                  if stage.window_mode() != WindowMode::Transparent || stage.is_fullscreen() {
                      stage.background_color().unwrap_or(Color::WHITE)
-@@ -2081,6 +2400,8 @@ impl Player {
+@@ -2081,6 +2402,8 @@ impl Player {
              (cache_draws, commands)
          });
  
@@ -13274,7 +14706,7 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..88361f4f69f9b3a27e577d7caaa2d7b8
          self.renderer
              .submit_frame(background_color, commands, cache_draws);
  
-@@ -2373,6 +2694,9 @@ impl Player {
+@@ -2373,6 +2696,9 @@ impl Player {
              let rval = func(context);
  
              Self::run_actions(context);
@@ -13284,7 +14716,7 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..88361f4f69f9b3a27e577d7caaa2d7b8
  
              rval
          });
-@@ -2384,11 +2708,140 @@ impl Player {
+@@ -2384,11 +2710,140 @@ impl Player {
          self.update_mouse_state(EnumSet::empty(), false, &mut false);
  
          // GC
@@ -13426,7 +14858,7 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..88361f4f69f9b3a27e577d7caaa2d7b8
      pub fn flush_shared_objects(&mut self) {
          self.update(|context| {
              if let Some(mut avm1_activation) =
-@@ -2939,6 +3392,7 @@ impl PlayerBuilder {
+@@ -2939,6 +3394,7 @@ impl PlayerBuilder {
          let fake_movie = SwfMovie::new(gc_context, SwfMovieData::empty(player_version, None));
  
          let data = GcRootData {
@@ -13434,7 +14866,7 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..88361f4f69f9b3a27e577d7caaa2d7b8
              audio_manager: AudioManager::new(),
              action_queue: ActionQueue::new(),
              avm1,
-@@ -2961,6 +3415,8 @@ impl PlayerBuilder {
+@@ -2961,6 +3417,8 @@ impl PlayerBuilder {
                  middle_pressed: None,
                  forced_cursor: None,
                  updating_drop_target: false,
@@ -13443,7 +14875,7 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..88361f4f69f9b3a27e577d7caaa2d7b8
              },
              avm1_shared_objects: HashMap::new(),
              avm2_shared_objects: HashMap::new(),
-@@ -3043,6 +3499,8 @@ impl PlayerBuilder {
+@@ -3043,6 +3501,8 @@ impl PlayerBuilder {
                  frame_phase: Default::default(),
                  frame_accumulator: FloatDuration::ZERO,
                  recent_run_frame_timings: VecDeque::with_capacity(10),
@@ -13452,7 +14884,7 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..88361f4f69f9b3a27e577d7caaa2d7b8
                  start_time: Instant::now(),
                  time_offset: 0,
                  time_til_next_timer: None,
-@@ -3214,6 +3672,108 @@ fn run_mouse_pick<'gc>(
+@@ -3214,6 +3674,108 @@ fn run_mouse_pick<'gc>(
      context: &mut UpdateContext<'gc>,
      require_button_mode: bool,
  ) -> Option<InteractiveObject<'gc>> {
@@ -13561,7 +14993,7 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..88361f4f69f9b3a27e577d7caaa2d7b8
      context.stage.iter_render_list().rev().find_map(|level| {
          level.as_interactive().and_then(|l| {
              if l.as_displayobject().movie().is_action_script_3() {
-@@ -3282,3 +3842,290 @@ pub enum PlayerMode {
+@@ -3282,3 +3844,290 @@ pub enum PlayerMode {
      /// Represents the debug version of Flash Player, i.e. flashplayerdebugger.
      Debug,
  }
@@ -13853,10 +15285,10 @@ index fce1e4dc01664b33e6592de7a176f5715f6785e1..88361f4f69f9b3a27e577d7caaa2d7b8
 +    })
 +}
 diff --git a/core/src/tessellation_cache.rs b/core/src/tessellation_cache.rs
-index cacd85384de3de95e416350798fb2abdb20bd8b8..52efdaba9c917112d847837072894699e175bdd6 100644
+index cacd85384de3de95e416350798fb2abdb20bd8b8..6ed271f82d62f2b427523a948ea4d0fb6af595a6 100644
 --- a/core/src/tessellation_cache.rs
 +++ b/core/src/tessellation_cache.rs
-@@ -1,19 +1,323 @@
+@@ -1,19 +1,343 @@
 -use ruffle_render::backend::ShapeHandle;
 +use ruffle_render::backend::{NO_STRETCH, ShapeHandle, Stretch};
 +use ruffle_render::tessellator::{EdgeMode, edge_mode};
@@ -13901,7 +15333,7 @@ index cacd85384de3de95e416350798fb2abdb20bd8b8..52efdaba9c917112d847837072894699
 +    id: u32,
 +}
 +
-+/// AQW build, for lean render's check only (`RUFFLE_LEAN_RENDER_VERIFY`): which cache (a
++/// AQW build, for the checks only (`RUFFLE_LEAN_RENDER_VERIFY`, and `self_check`'s): which cache (a
 +/// shape's, a drawing's) each tessellation was made for.
 +///
 +/// The check draws a branch twice in one picture and compares the tessellations. Both times
@@ -13935,6 +15367,7 @@ index cacd85384de3de95e416350798fb2abdb20bd8b8..52efdaba9c917112d847837072894699
 +
 +    pub(super) fn on() -> bool {
 +        crate::display_object::replay::lean_verify()
++            || crate::display_object::self_check::any()
 +    }
 +
 +    pub(super) fn note(handle: &ShapeHandle, cache: u32) {
@@ -13958,6 +15391,11 @@ index cacd85384de3de95e416350798fb2abdb20bd8b8..52efdaba9c917112d847837072894699
 +        });
 +    }
 +
++    /// The cache `handle` was made for, if known (for the checks' reports).
++    pub(super) fn cache_of(handle: &ShapeHandle) -> Option<u32> {
++        MADE.with(|made| made.borrow().get(&address(handle)).map(|made| made.1))
++    }
++
 +    pub(super) fn alike(a: &ShapeHandle, b: &ShapeHandle) -> bool {
 +        MADE.with(|made| {
 +            let made = made.borrow();
@@ -13973,6 +15411,20 @@ index cacd85384de3de95e416350798fb2abdb20bd8b8..52efdaba9c917112d847837072894699
 +/// only) were made for the same cache, i.e. from the same shape.
 +pub(crate) fn made_alike(a: &ShapeHandle, b: &ShapeHandle) -> bool {
 +    std::sync::Arc::ptr_eq(&a.0, &b.0) || made_for::alike(a, b)
++}
++
++/// AQW build, for the checks' reports: which cache a tessellation was made for (`None`: not
++/// known), and whether it stands in for one still being made.
++pub(crate) fn describe_tessellation(handle: &ShapeHandle) -> String {
++    format!(
++        "{}{}",
++        made_for::cache_of(handle).map_or_else(|| "cache unknown".to_string(), |id| format!("cache {id}")),
++        if crate::display_object::graphic::deferred_shapes::is_placeholder(handle) {
++            ", a stand-in"
++        } else {
++            ""
++        }
++    )
 +}
 +
 +/// AQW build: what a tessellation was made for. With Flash-style edges, a shape is tessellated
@@ -14187,7 +15639,7 @@ index cacd85384de3de95e416350798fb2abdb20bd8b8..52efdaba9c917112d847837072894699
  }
  
  /// A cache for tessellated shapes at different scales, using a simple LRU eviction policy.
-@@ -29,25 +333,118 @@ impl TessellationCache {
+@@ -29,25 +353,118 @@ impl TessellationCache {
          Self {
              entries: std::array::from_fn(|_| None),
              len: 0,
@@ -14312,7 +15764,7 @@ index cacd85384de3de95e416350798fb2abdb20bd8b8..52efdaba9c917112d847837072894699
                      // Choose the cached entry with the smallest deviation from the target scale.
                      let deviation = f32::abs(ratio - 1.0);
  
-@@ -55,6 +452,9 @@ impl TessellationCache {
+@@ -55,6 +472,9 @@ impl TessellationCache {
                          best_deviation = deviation;
                          best_index = Some(index);
                      }
@@ -14322,7 +15774,7 @@ index cacd85384de3de95e416350798fb2abdb20bd8b8..52efdaba9c917112d847837072894699
                  }
              }
          }
-@@ -67,10 +467,14 @@ impl TessellationCache {
+@@ -67,10 +487,14 @@ impl TessellationCache {
      ///
      /// If the cache is full, the least recently used entry will be evicted to make room for the new entry.
      /// We assume that the caller has already checked that the new entry is not too similar to existing entries.
@@ -14340,7 +15792,7 @@ index cacd85384de3de95e416350798fb2abdb20bd8b8..52efdaba9c917112d847837072894699
              self.len += 1;
              return;
          }
-@@ -80,7 +484,37 @@ impl TessellationCache {
+@@ -80,7 +504,37 @@ impl TessellationCache {
              self.entries[i - 1] = self.entries[i].take();
          }
  
@@ -14379,7 +15831,7 @@ index cacd85384de3de95e416350798fb2abdb20bd8b8..52efdaba9c917112d847837072894699
      }
  
      /// Returns the number of cached entries currently stored in the cache.
-@@ -90,6 +524,9 @@ impl TessellationCache {
+@@ -90,6 +544,9 @@ impl TessellationCache {
  
      /// Moves the entry at the given index to the most recently used position and returns its shape handle.
      fn touch_entry(&mut self, index: usize) -> ShapeHandle {
@@ -14389,7 +15841,7 @@ index cacd85384de3de95e416350798fb2abdb20bd8b8..52efdaba9c917112d847837072894699
          if index == self.len - 1 {
              // The entry is already the most recently used, so we can return its handle directly.
              return self.entries[index]
-@@ -110,3 +547,80 @@ impl TessellationCache {
+@@ -110,3 +567,80 @@ impl TessellationCache {
          entry.1
      }
  }
@@ -14471,7 +15923,7 @@ index cacd85384de3de95e416350798fb2abdb20bd8b8..52efdaba9c917112d847837072894699
 +    }
 +}
 diff --git a/desktop/Cargo.toml b/desktop/Cargo.toml
-index e9a8c49aa8a8e6f5ae6eeec3c098146b798a1bca..c9958c3a8e8c1a1ebcdc777d4b6f11ab9f9f5363 100644
+index e9a8c49aa8a8e6f5ae6eeec3c098146b798a1bca..6d1873deb758873d0529c3ec85d3d2ffb9ca51c7 100644
 --- a/desktop/Cargo.toml
 +++ b/desktop/Cargo.toml
 @@ -12,6 +12,12 @@ workspace = true
@@ -14523,8 +15975,8 @@ index e9a8c49aa8a8e6f5ae6eeec3c098146b798a1bca..c9958c3a8e8c1a1ebcdc777d4b6f11ab
 +CompanyName = "Mugetsu"
 +LegalCopyright = "Mugetsu; based on Ruffle, Copyright © 2018 Ruffle LLC and Ruffle contributors"
 +# Keep equal to `mugetsu::VERSION` (desktop/src/mugetsu.rs).
-+ProductVersion = "2.0.1"
-+FileVersion = "2.0.1 (Ruffle 0.8.0-nightly.2026.11.10)"
++ProductVersion = "2.0.2"
++FileVersion = "2.0.2 (Ruffle 0.8.0-nightly.2026.11.10)"
  # InternalName should be the same as the module name
  InternalName = "ruffle_desktop"
 -OriginalFilename = "ruffle.exe"
@@ -19505,7 +20957,7 @@ index 851e5710184936cde95132fe499f14604b9ec283..148d4c933b35c4a428bd2037c9075895
  
  // Shamelessly stolen from egui menu::set_menu_style, a private internal function
 diff --git a/desktop/src/gui/controller.rs b/desktop/src/gui/controller.rs
-index c9cefab4901a540dbb35ef278aa6e04d9151c96e..3a1eb1705a210e821c4772190cf72e3555d62727 100644
+index c9cefab4901a540dbb35ef278aa6e04d9151c96e..759558edaf98c847fa3cf0d719559cd41077158d 100644
 --- a/desktop/src/gui/controller.rs
 +++ b/desktop/src/gui/controller.rs
 @@ -17,11 +17,12 @@ use ruffle_render_wgpu::backend::{
@@ -19522,7 +20974,7 @@ index c9cefab4901a540dbb35ef278aa6e04d9151c96e..3a1eb1705a210e821c4772190cf72e35
  use std::time::{Duration, Instant};
  use url::Url;
  use winit::dpi::{PhysicalPosition, PhysicalSize};
-@@ -30,23 +31,48 @@ use winit::event_loop::EventLoopProxy;
+@@ -30,23 +31,51 @@ use winit::event_loop::EventLoopProxy;
  use winit::keyboard::{Key, NamedKey};
  use winit::window::{ImePurpose as WinitImePurpose, Theme, Window};
  
@@ -19531,6 +20983,9 @@ index c9cefab4901a540dbb35ef278aa6e04d9151c96e..3a1eb1705a210e821c4772190cf72e35
 +struct SurfaceSlot {
 +    surface: wgpu::Surface<'static>,
 +    config: wgpu::SurfaceConfiguration,
++    /// Whether the window frame draws over the buffer's last picture instead of clearing it
++    /// first, while a movie is shown (see `set_vsync` and `present_frame`).
++    keep_picture: bool,
 +}
 +
 +/// AQW build: a window frame to draw and present (see `present_frame`).
@@ -19574,7 +21029,7 @@ index c9cefab4901a540dbb35ef278aa6e04d9151c96e..3a1eb1705a210e821c4772190cf72e35
      theme_controller: ThemeController,
      #[cfg(feature = "tracy_images")]
      tracy_frame_captures: crate::tracy::FrameCapturesHolder,
-@@ -61,23 +87,106 @@ impl GuiController {
+@@ -61,23 +90,106 @@ impl GuiController {
          initial_movie_url: Option<Url>,
          no_gui: bool,
      ) -> anyhow::Result<Self> {
@@ -19691,7 +21146,7 @@ index c9cefab4901a540dbb35ef278aa6e04d9151c96e..3a1eb1705a210e821c4772190cf72e35
          let preferred_formats = [
              // by egui
              wgpu::TextureFormat::Rgba8Unorm,
-@@ -96,20 +205,18 @@ impl GuiController {
+@@ -96,20 +208,18 @@ impl GuiController {
              });
          tracing::info!("Using surface format {:?}", surface_format);
          let size = window.inner_size();
@@ -19724,7 +21179,7 @@ index c9cefab4901a540dbb35ef278aa6e04d9151c96e..3a1eb1705a210e821c4772190cf72e35
          let descriptors = Descriptors::new(instance, adapter, device, queue);
          let egui_ctx = Context::default();
          // The rest of the desktop UI (menu bar offset, movie viewport, egui-wgpu
-@@ -171,16 +278,21 @@ impl GuiController {
+@@ -171,16 +281,22 @@ impl GuiController {
          Ok(Self {
              descriptors,
              egui_winit,
@@ -19739,6 +21194,7 @@ index c9cefab4901a540dbb35ef278aa6e04d9151c96e..3a1eb1705a210e821c4772190cf72e35
 +            surface: Arc::new(Mutex::new(SurfaceSlot {
 +                surface,
 +                config: surface_config,
++                keep_picture: false,
 +            })),
              movie_view_renderer,
 +            present: PresentThread::enabled().then(|| PresentThread::new("present")),
@@ -19749,7 +21205,7 @@ index c9cefab4901a540dbb35ef278aa6e04d9151c96e..3a1eb1705a210e821c4772190cf72e35
              theme_controller,
              #[cfg(feature = "tracy_images")]
              tracy_frame_captures,
-@@ -210,21 +322,59 @@ impl GuiController {
+@@ -210,21 +326,79 @@ impl GuiController {
          }
      }
  
@@ -19768,26 +21224,46 @@ index c9cefab4901a540dbb35ef278aa6e04d9151c96e..3a1eb1705a210e821c4772190cf72e35
 +    /// v-sync that the system has. The caller lets everything on its way through first, as
 +    /// before a resize. Says what it got.
 +    pub fn set_vsync(&self, vsync: bool) -> &'static str {
-+        let (mode, got) = if vsync {
-+            (wgpu::PresentMode::Fifo, "in step with the monitor (v-sync)")
++        let (mode, got, immediate) = if vsync {
++            (wgpu::PresentMode::Fifo, "in step with the monitor (v-sync)", false)
 +        } else {
 +            let has = lock(&self.surface)
 +                .surface
 +                .get_capabilities(&self.descriptors.adapter)
 +                .present_modes;
-+            let got = if has.contains(&wgpu::PresentMode::Immediate) {
++            let immediate = has.contains(&wgpu::PresentMode::Immediate);
++            let got = if immediate {
 +                "at once (immediate)"
 +            } else if has.contains(&wgpu::PresentMode::Mailbox) {
 +                "at once, the newest at each refresh (mailbox)"
 +            } else {
 +                "in step with the monitor: this system has no other way"
 +            };
-+            (wgpu::PresentMode::AutoNoVsync, got)
++            (wgpu::PresentMode::AutoNoVsync, got, immediate)
 +        };
++        // A player's screen captures of DirectX 12 at 700-2,500 frames a second (uncapped,
++        // immediate) showed half-drawn pictures: black, with part of the game's picture. There a
++        // buffer comes back to Mugetsu within about a millisecond of being sent, and a capture
++        // that copies it late reads it while the next frame is drawn into it, which starts with
++        // a clear to black. Without the clear such a copy shows the last picture partly
++        // overwritten by the next, which looks the same. Only where the movie's picture covers
++        // the whole window (no menu bar: `--no-gui`, as AQW is played), and only for DirectX 12
++        // immediate: everything else (Vulkan, v-sync, mailbox) clears as before.
++        let keep_picture = immediate
++            && self.no_gui
++            && self.descriptors.adapter.get_info().backend == wgpu::Backend::Dx12
++            && std::env::var_os("RUFFLE_CAPTURE_SAFE").is_some();
++        if keep_picture {
++            tracing::info!(
++                target: "ruffle_aqw_perf",
++                "final pass: drawn over the buffer's previous picture, not cleared first (capture-safe; no-capture-safe turns it off)"
++            );
++        }
 +        let changed = {
 +            let mut slot = lock(&self.surface);
 +            let changed = slot.config.present_mode != mode;
 +            slot.config.present_mode = mode;
++            slot.keep_picture = keep_picture;
 +            changed
 +        };
 +        if changed {
@@ -19813,7 +21289,7 @@ index c9cefab4901a540dbb35ef278aa6e04d9151c96e..3a1eb1705a210e821c4772190cf72e35
 -        );
 +        {
 +            let mut slot = lock(&self.surface);
-+            let SurfaceSlot { surface, config } = &mut *slot;
++            let SurfaceSlot { surface, config, .. } = &mut *slot;
 +            config.width = self.size.width;
 +            config.height = self.size.height;
 +            // AQW build: (with the render thread: nothing submits meanwhile.)
@@ -19823,7 +21299,7 @@ index c9cefab4901a540dbb35ef278aa6e04d9151c96e..3a1eb1705a210e821c4772190cf72e35
          self.movie_view_renderer.update_resolution(
              &self.descriptors,
              self.window.fullscreen().is_none() && !self.no_gui,
-@@ -258,7 +408,11 @@ impl GuiController {
+@@ -258,7 +432,11 @@ impl GuiController {
          }
  
          let response = self.egui_winit.on_window_event(&self.window, event);
@@ -19836,7 +21312,7 @@ index c9cefab4901a540dbb35ef278aa6e04d9151c96e..3a1eb1705a210e821c4772190cf72e35
              self.window.request_redraw();
          }
          response.consumed
-@@ -281,12 +435,25 @@ impl GuiController {
+@@ -281,12 +459,25 @@ impl GuiController {
          let movie_view = MovieView::new(
              self.movie_view_renderer.clone(),
              &self.descriptors.device,
@@ -19864,7 +21340,7 @@ index c9cefab4901a540dbb35ef278aa6e04d9151c96e..3a1eb1705a210e821c4772190cf72e35
          self.gui.on_player_created(
              opt,
              content_descriptor,
-@@ -305,63 +472,24 @@ impl GuiController {
+@@ -305,63 +496,24 @@ impl GuiController {
      }
  
      pub fn window_to_movie_position(&self, position: PhysicalPosition<f64>) -> (f64, f64) {
@@ -19939,7 +21415,7 @@ index c9cefab4901a540dbb35ef278aa6e04d9151c96e..3a1eb1705a210e821c4772190cf72e35
          #[cfg(feature = "tracy_images")]
          if player.is_none() {
              self.tracy_frame_captures
-@@ -370,6 +498,8 @@ impl GuiController {
+@@ -370,6 +522,8 @@ impl GuiController {
  
          let raw_input = self.egui_winit.take_egui_input(&self.window);
          let show_menu = self.window.fullscreen().is_none() && !self.no_gui;
@@ -19948,7 +21424,7 @@ index c9cefab4901a540dbb35ef278aa6e04d9151c96e..3a1eb1705a210e821c4772190cf72e35
          let mut full_output = self.egui_winit.egui_ctx().run_ui(raw_input, |ui| {
              self.gui.update(
                  self.egui_winit.egui_ctx(),
-@@ -382,7 +512,13 @@ impl GuiController {
+@@ -382,7 +536,13 @@ impl GuiController {
                      0.0
                  },
              );
@@ -19962,7 +21438,7 @@ index c9cefab4901a540dbb35ef278aa6e04d9151c96e..3a1eb1705a210e821c4772190cf72e35
          self.repaint_after = full_output
              .viewport_output
              .get(&ViewportId::ROOT)
-@@ -412,118 +548,131 @@ impl GuiController {
+@@ -412,118 +572,131 @@ impl GuiController {
              pixels_per_point: scale_factor,
          };
  
@@ -20184,7 +21660,7 @@ index c9cefab4901a540dbb35ef278aa6e04d9151c96e..3a1eb1705a210e821c4772190cf72e35
      pub fn needs_render(&self) -> bool {
          Instant::now().duration_since(self.last_update) >= self.repaint_after
      }
-@@ -534,6 +683,7 @@ impl GuiController {
+@@ -534,6 +707,7 @@ impl GuiController {
  
      pub fn open_dialog(&mut self, dialog_event: DialogDescriptor) {
          self.gui.dialogs.open_dialog(dialog_event);
@@ -20192,7 +21668,7 @@ index c9cefab4901a540dbb35ef278aa6e04d9151c96e..3a1eb1705a210e821c4772190cf72e35
      }
  
      pub fn set_ime_allowed(&self, allowed: bool) {
-@@ -589,7 +739,24 @@ fn select_wgpu_backend(
+@@ -589,7 +763,24 @@ fn select_wgpu_backend(
          format_list(&get_backend_names(preferred_backends), "or")
      );
  
@@ -20218,7 +21694,7 @@ index c9cefab4901a540dbb35ef278aa6e04d9151c96e..3a1eb1705a210e821c4772190cf72e35
          if let Some(instance) = try_wgpu_backend(backend, window.clone()) {
              tracing::info!(
                  "Using fallback backend {}",
-@@ -618,6 +785,167 @@ fn try_wgpu_backend(backend: wgpu::Backends, window: Arc<Window>) -> Option<wgpu
+@@ -618,6 +809,197 @@ fn try_wgpu_backend(backend: wgpu::Backends, window: Arc<Window>) -> Option<wgpu
  }
  
  // Load fallback fonts
@@ -20276,7 +21752,7 @@ index c9cefab4901a540dbb35ef278aa6e04d9151c96e..3a1eb1705a210e821c4772190cf72e35
 +            // platform-specific reasons, wgpu bugs?).
 +            // Testing on Vulkan shows that reconfiguring the surface works in that case.
 +            tracing::warn!("Surface became unavailable: {:?}, reconfiguring", state);
-+            let SurfaceSlot { surface, config } = &mut *slot;
++            let SurfaceSlot { surface, config, .. } = &mut *slot;
 +            // AQW build: (with the render thread: nothing submits meanwhile.)
 +            let _gate = ruffle_render_wgpu::render_thread::reconfiguring();
 +            surface.configure(&descriptors.device, config);
@@ -20324,6 +21800,16 @@ index c9cefab4901a540dbb35ef278aa6e04d9151c96e..3a1eb1705a210e821c4772190cf72e35
 +
 +    {
 +        let surface_view = surface_texture.texture.create_view(&Default::default());
++        // AQW build: (see `GuiController::set_vsync`.) The movie's quad is the whole surface
++        // without a menu bar and is drawn with blending off, so it replaces every pixel before
++        // the UI blends over it; and wgpu clears nothing for `DontCare` (no zero-init either,
++        // as it would for `Load` on a fresh surface texture).
++        let load = if slot.keep_picture && frame.movie.is_some() {
++            // SAFETY: the quad writes every pixel before any is blended or stored (see above).
++            wgpu::LoadOp::DontCare(unsafe { wgpu::LoadOpDontCare::enabled() })
++        } else {
++            wgpu::LoadOp::Clear(clear_color())
++        };
 +
 +        let mut render_pass = encoder
 +            .begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -20331,7 +21817,7 @@ index c9cefab4901a540dbb35ef278aa6e04d9151c96e..3a1eb1705a210e821c4772190cf72e35
 +                    view: &surface_view,
 +                    resolve_target: None,
 +                    ops: wgpu::Operations {
-+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
++                        load,
 +                        store: wgpu::StoreOp::Store,
 +                    },
 +                    depth_slice: None,
@@ -20372,6 +21858,26 @@ index c9cefab4901a540dbb35ef278aa6e04d9151c96e..3a1eb1705a210e821c4772190cf72e35
 +    tracy_frame_captures.finish_frame();
 +}
 +
++/// AQW build: what the window frame is cleared to: black, or magenta with
++/// `RUFFLE_TEST_CLEAR_COLOR=magenta` (testing: a picture of the window then shows any pixel
++/// neither the movie nor the UI drew).
++fn clear_color() -> wgpu::Color {
++    static MAGENTA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    let magenta = *MAGENTA.get_or_init(|| {
++        std::env::var("RUFFLE_TEST_CLEAR_COLOR").is_ok_and(|color| color == "magenta")
++    });
++    if magenta {
++        wgpu::Color {
++            r: 1.0,
++            g: 0.0,
++            b: 1.0,
++            a: 1.0,
++        }
++    } else {
++        wgpu::Color::BLACK
++    }
++}
++
 +/// Frees the UI textures `frame` no longer uses.
 +fn free_textures(egui_renderer: &mut egui_wgpu::Renderer, frame: &mut GuiFrame) {
 +    for id in frame.textures_delta.free.drain() {
@@ -20386,7 +21892,7 @@ index c9cefab4901a540dbb35ef278aa6e04d9151c96e..3a1eb1705a210e821c4772190cf72e35
  fn load_system_fonts(
      font_database: &Database,
      locale: unic_langid::LanguageIdentifier,
-@@ -802,3 +1130,61 @@ fn mmap_system_font(path: &Path) -> anyhow::Result<memmap2::Mmap> {
+@@ -802,3 +1184,61 @@ fn mmap_system_font(path: &Path) -> anyhow::Result<memmap2::Mmap> {
      let mmap = mmap.map_err(|e| anyhow!("Failed to mmap font file at {path:?}: {e}"))?;
      Ok(mmap)
  }
@@ -22232,10 +23738,10 @@ index 0000000000000000000000000000000000000000..0fc53a49ba553dde62dfa256f8679daf
 +}
 diff --git a/desktop/src/mugetsu.rs b/desktop/src/mugetsu.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..557a8a773fcccfce9be77f66864faba47a4666bf
+index 0000000000000000000000000000000000000000..a2413b3e5b9c5b6353687c20d9e150071f58d579
 --- /dev/null
 +++ b/desktop/src/mugetsu.rs
-@@ -0,0 +1,1776 @@
+@@ -0,0 +1,1819 @@
 +//! AQW build (Mugetsu): things the release player does on its own, without a launcher:
 +//! the window title, remembering that the Vulkan driver crashed on this PC (so the next start
 +//! uses DirectX 12), the "running on the built-in graphics" tip and the new-version notice.
@@ -22248,7 +23754,7 @@ index 0000000000000000000000000000000000000000..557a8a773fcccfce9be77f66864faba4
 +
 +/// Mugetsu's own version. Keep it equal to `ProductVersion` in desktop/Cargo.toml
 +/// ([package.metadata.winresource]) and to the GitHub release tag (`v1.1.1`).
-+pub const VERSION: &str = "2.0.1";
++pub const VERSION: &str = "2.0.2";
 +
 +const RELEASES_API: &str = "https://api.github.com/repos/mugetsu-aqw/mugetsu/releases/latest";
 +const RELEASES_PAGE: &str = "https://github.com/mugetsu-aqw/mugetsu/releases/latest";
@@ -23241,7 +24747,7 @@ index 0000000000000000000000000000000000000000..557a8a773fcccfce9be77f66864faba4
 +/// unless their `no-...` file or `safe-drawing` is next to the exe. The code that reads each
 +/// variable still has it off unless it is set, so a movie on the command line and the tests
 +/// run without them unless they ask.
-+const DEFAULT_ON: [(&str, &str, &str); 8] = [
++const DEFAULT_ON: [(&str, &str, &str); 9] = [
 +    // The per-frame walks skip the branches with nothing to do: frame construction and frame
 +    // scripts, and `enter_frame`.
 +    ("lean-scripts", "RUFFLE_LEAN_SCRIPTS", "no-lean-scripts"),
@@ -23264,7 +24770,19 @@ index 0000000000000000000000000000000000000000..557a8a773fcccfce9be77f66864faba4
 +    // next frame (see core's `frame_lifecycle::early_scripts`). Without it colour-custom
 +    // armour, hair, capes and helms show in the colours they were drawn in for a moment.
 +    ("early-scripts", "RUFFLE_EARLY_SCRIPTS", "no-early-scripts"),
++    // Not a speed-up: with DirectX 12 and uncapped pacing the window's frame is drawn over the
++    // buffer's last picture instead of clearing it to black first (see the window's
++    // `set_vsync`). A player's screen captures at 700-2,500 frames a second showed
++    // half-drawn pictures, black with part of the game's: a capture that copies a buffer late
++    // reads it while the next frame is drawn into it. On only by default while
++    // `CAPTURE_SAFE_BY_DEFAULT` is.
++    ("capture-safe", CAPTURE_SAFE, "no-capture-safe"),
 +];
++
++const CAPTURE_SAFE: &str = "RUFFLE_CAPTURE_SAFE";
++
++/// Whether `capture-safe` is on when AQW is played (`false`: only with its file next to the exe).
++const CAPTURE_SAFE_BY_DEFAULT: bool = true;
 +
 +/// Pictures recorded on a render thread: ON with frame interpolation (as saved when Mugetsu
 +/// starts), which is where it pays: without interpolation the game's own 30 pictures a second
@@ -23273,7 +24791,7 @@ index 0000000000000000000000000000000000000000..557a8a773fcccfce9be77f66864faba4
 +const RENDER_THREAD: &str = "RUFFLE_RENDER_THREAD";
 +
 +/// Switches that are only on with their file next to the exe.
-+const BY_FILE: [(&str, &str); 11] = [
++const BY_FILE: [(&str, &str); 13] = [
 +    // A room-entry picture is not held for its new cached objects' shapes (see core's
 +    // `deferred_shapes::entry_hold`): they are drawn blank until done, as from 2026-10-28.
 +    ("no-entry-hold", "RUFFLE_NO_ENTRY_HOLD"),
@@ -23293,6 +24811,14 @@ index 0000000000000000000000000000000000000000..557a8a773fcccfce9be77f66864faba4
 +    ("lean-verify", "RUFFLE_LEAN_VERIFY"),
 +    // Lean render's check: the unchanged branches are walked as well and compared.
 +    ("lean-render-verify", "RUFFLE_LEAN_RENDER_VERIFY"),
++    // The cached objects' check: once per frame, a cached object drawn from its kept picture
++    // has its contents walked again (drawing nothing) and compared with what the picture was
++    // drawn from; a picture that stays out of date is reported ("CACHE VERIFY", and the
++    // "cache verify" line). See core's `self_check`.
++    ("cache-verify", "RUFFLE_CACHE_VERIFY"),
++    // Frame interpolation's check: every replayed in-between picture is walked as well and
++    // compared ("REPLAY VERIFY", and the "replay verify" line).
++    ("replay-verify", "RUFFLE_REPLAY_VERIFY"),
 +    ("render-thread", RENDER_THREAD),
 +    // The pick's check: every skipped branch is picked in full as well, and a difference is
 +    // reported in the log ("PICK MISMATCH", "PICK NOTE OUT OF DATE"); and its cost and counts
@@ -23311,7 +24837,8 @@ index 0000000000000000000000000000000000000000..557a8a773fcccfce9be77f66864faba4
 +    }
 +    for (file, var, off) in DEFAULT_ON {
 +        // Its own file brings one back under `safe-drawing` (to find the one at fault).
-+        if !flag(off) && (flag(file) || !safe) {
++        let by_default = !safe && (CAPTURE_SAFE_BY_DEFAULT || var != CAPTURE_SAFE);
++        if !flag(off) && (flag(file) || by_default) {
 +            vars.push(var);
 +        }
 +    }
@@ -23894,7 +25421,7 @@ index 0000000000000000000000000000000000000000..557a8a773fcccfce9be77f66864faba4
 +        assert!(parse_version("v1.0.10") > parse_version("1.0.9"));
 +    }
 +
-+    const NEW: [&str; 8] = [
++    const NEW: [&str; 9] = [
 +        "RUFFLE_LEAN_SCRIPTS",
 +        "RUFFLE_LEAN_FRAMES",
 +        "RUFFLE_LEAN_RENDER",
@@ -23903,9 +25430,17 @@ index 0000000000000000000000000000000000000000..557a8a773fcccfce9be77f66864faba4
 +        "RUFFLE_PICK_BOUNDS",
 +        "RUFFLE_SHARP_SNAPSHOTS",
 +        "RUFFLE_EARLY_SCRIPTS",
++        "RUFFLE_CAPTURE_SAFE",
 +    ];
 +
 +    const THREAD: &str = super::RENDER_THREAD;
++
++    /// `NEW` as shipped (`capture-safe` may be off by default).
++    fn on_by_default() -> Vec<&'static str> {
++        NEW.into_iter()
++            .filter(|var| super::CAPTURE_SAFE_BY_DEFAULT || *var != super::CAPTURE_SAFE)
++            .collect()
++    }
 +
 +    /// Without frame interpolation.
 +    fn variables(files: &[&str]) -> Vec<&'static str> {
@@ -23918,17 +25453,28 @@ index 0000000000000000000000000000000000000000..557a8a773fcccfce9be77f66864faba4
 +
 +    #[test]
 +    fn speed_ups_are_on_without_any_file() {
-+        assert_eq!(variables(&[]), NEW);
++        assert_eq!(variables(&[]), on_by_default());
 +    }
 +
 +    #[test]
 +    fn a_no_file_turns_one_speed_up_off() {
 +        let vars = variables(&["no-lean-render"]);
 +        assert!(!vars.contains(&"RUFFLE_LEAN_RENDER"));
-+        assert_eq!(vars.len(), NEW.len() - 1);
++        assert_eq!(vars.len(), on_by_default().len() - 1);
 +        // Also against the file that used to turn it on (the dev install has those).
 +        let vars = variables(&["lean-render", "no-lean-render"]);
 +        assert!(!vars.contains(&"RUFFLE_LEAN_RENDER"));
++    }
++
++    #[test]
++    fn capture_safe_follows_its_files() {
++        assert_eq!(
++            variables(&[]).contains(&super::CAPTURE_SAFE),
++            super::CAPTURE_SAFE_BY_DEFAULT
++        );
++        assert!(variables(&["capture-safe"]).contains(&super::CAPTURE_SAFE));
++        assert!(!variables(&["no-capture-safe"]).contains(&super::CAPTURE_SAFE));
++        assert!(!variables(&["capture-safe", "no-capture-safe"]).contains(&super::CAPTURE_SAFE));
 +    }
 +
 +    #[test]
@@ -23945,7 +25491,10 @@ index 0000000000000000000000000000000000000000..557a8a773fcccfce9be77f66864faba4
 +        assert!(!variables(&[]).contains(&THREAD));
 +        // (Only on Windows so far.)
 +        assert_eq!(interpolating(&[]).contains(&THREAD), cfg!(windows));
-+        assert_eq!(interpolating(&[]).len(), NEW.len() + usize::from(cfg!(windows)));
++        assert_eq!(
++            interpolating(&[]).len(),
++            on_by_default().len() + usize::from(cfg!(windows))
++        );
 +        // Its files: on without interpolation, off with it.
 +        assert!(variables(&["render-thread"]).contains(&THREAD));
 +        assert!(!interpolating(&["no-render-thread"]).contains(&THREAD));
@@ -23985,7 +25534,7 @@ index 0000000000000000000000000000000000000000..557a8a773fcccfce9be77f66864faba4
 +            // (No longer a switch file: it lost the graphics device on 2026-11-14.)
 +            "lean-pools",
 +        ]);
-+        for var in NEW.into_iter().chain([
++        for var in on_by_default().into_iter().chain([
 +            "RUFFLE_FLASH_AA",
 +            "RUFFLE_PICK_STATS",
 +            "RUFFLE_RENDER_THREAD",
@@ -23993,7 +25542,7 @@ index 0000000000000000000000000000000000000000..557a8a773fcccfce9be77f66864faba4
 +            assert_eq!(vars.iter().filter(|v| **v == var).count(), 1, "{var}");
 +        }
 +        assert!(!vars.contains(&"RUFFLE_LEAN_POOLS"));
-+        assert_eq!(vars.len(), NEW.len() + 3);
++        assert_eq!(vars.len(), on_by_default().len() + 3);
 +    }
 +}
 +
@@ -25199,10 +26748,10 @@ index 9a532e3dc1addc2c869d86e1ab6defe3b269d9e3..0e6f02a1732de34009393be0aba5d052
  
  impl CommandHandler for CommandList {
 diff --git a/render/src/filters.rs b/render/src/filters.rs
-index ea347fc2b44459ee4de6df4d482eb6f872e40c7c..bcb1991f4c2f7e962ea7e37b7990e66f9027fbaf 100644
+index ea347fc2b44459ee4de6df4d482eb6f872e40c7c..cf903088465c548c55e2e4f7479215a7804b01f7 100644
 --- a/render/src/filters.rs
 +++ b/render/src/filters.rs
-@@ -87,6 +87,15 @@ impl Filter {
+@@ -87,12 +87,23 @@ impl Filter {
      }
  
      pub fn calculate_dest_rect(&self, source_rect: Rectangle<Twips>) -> Rectangle<Twips> {
@@ -25218,6 +26767,14 @@ index ea347fc2b44459ee4de6df4d482eb6f872e40c7c..bcb1991f4c2f7e962ea7e37b7990e66f
          match self {
              Filter::BlurFilter(filter) => filter.calculate_dest_rect(source_rect),
              Filter::GlowFilter(filter) => filter.calculate_dest_rect(source_rect),
+             Filter::DropShadowFilter(filter) => filter.calculate_dest_rect(source_rect),
+             Filter::BevelFilter(filter) => filter.calculate_dest_rect(source_rect),
+             Filter::DisplacementMapFilter(filter) => filter.calculate_dest_rect(source_rect),
++            // AQW build: drawn since by the wgpu renderer (it was skipped, so had no growth).
++            Filter::GradientGlowFilter(filter) => filter.calculate_dest_rect(source_rect),
+             _ => source_rect,
+         }
+     }
 diff --git a/render/src/tessellator.rs b/render/src/tessellator.rs
 index 55d6bc8433c6fce72a408e31028dfa72d52bf061..e60a8fe609e9b74bba0821d7477ec1102f9c30d4 100644
 --- a/render/src/tessellator.rs
@@ -27934,6 +29491,90 @@ index 0000000000000000000000000000000000000000..17aa615c555e59f34f2cdc7570867fb1
 +
 +    return color;
 +}
+diff --git a/render/wgpu/shaders/filter/gradient_glow.wgsl b/render/wgpu/shaders/filter/gradient_glow.wgsl
+new file mode 100644
+index 0000000000000000000000000000000000000000..47ebb36c7a1cf834660e0f5a531bc6327630043b
+--- /dev/null
++++ b/render/wgpu/shaders/filter/gradient_glow.wgsl
+@@ -0,0 +1,78 @@
++// AQW build: the gradient glow filter (see `filters/gradient_glow.rs`).
++struct Filter {
++    // The 256-entry lookup table, RGBA8 (not premultiplied), four entries per vector.
++    ramp: array<vec4<u32>, 64>,
++    strength: f32,
++    // 0: outer, 1: inner, 2: full.
++    glow_type: u32,
++    knockout: u32,
++    _padding: u32,
++}
++
++@group(0) @binding(0) var texture: texture_2d<f32>;
++@group(0) @binding(1) var texture_sampler: sampler;
++@group(0) @binding(2) var<uniform> filter_args: Filter;
++@group(0) @binding(3) var blurred: texture_2d<f32>;
++
++struct VertexOutput {
++    @builtin(position) position: vec4<f32>,
++    @location(0) source_uv: vec2<f32>,
++    @location(1) blur_uv: vec2<f32>,
++};
++
++struct VertexInput {
++    @location(0) position: vec2<f32>,
++    @location(1) source_uv: vec2<f32>,
++    @location(2) blur_uv: vec2<f32>,
++};
++
++@vertex
++fn main_vertex(in: VertexInput) -> VertexOutput {
++    let pos = vec4<f32>((in.position.x * 2.0 - 1.0), (1.0 - in.position.y * 2.0), 0.0, 1.0);
++    return VertexOutput(pos, in.source_uv, in.blur_uv);
++}
++
++// The lookup table's entry for `value` (0..1), premultiplied.
++fn lookup(value: f32) -> vec4<f32> {
++    let index = u32(round(saturate(value) * 255.0));
++    // No coverage, no glow, whatever the gradient's first colour is (Flash leaves an opaque
++    // object untouched by an inner glow whose gradient starts opaque: avm2/filters_array_holes).
++    if (index == 0u) {
++        return vec4<f32>(0.0);
++    }
++    let entry = unpack4x8unorm(filter_args.ramp[index / 4u][index % 4u]);
++    return vec4<f32>(entry.rgb * entry.a, entry.a);
++}
++
++@fragment
++fn main_fragment(in: VertexOutput) -> @location(0) vec4<f32> {
++    let knockout = filter_args.knockout > 0u;
++    var blur = textureSample(blurred, texture_sampler, in.blur_uv).a;
++    let dest = textureSample(texture, texture_sampler, in.source_uv);
++
++    if (in.blur_uv.x < 0.0 || in.blur_uv.x > 1.0 || in.blur_uv.y < 0.0 || in.blur_uv.y > 1.0) {
++        blur = 0.0;
++    }
++
++    if (filter_args.glow_type == 1u) {
++        // Inner: inside the object, from its inverted (blurred) alpha.
++        let glow = lookup((1.0 - blur) * filter_args.strength);
++        if (knockout) {
++            return glow * dest.a;
++        }
++        return glow * dest.a + dest * (1.0 - glow.a);
++    }
++    let glow = lookup(blur * filter_args.strength);
++    if (filter_args.glow_type == 2u) {
++        // Full: everywhere, on top of the object.
++        if (knockout) {
++            return glow;
++        }
++        return glow + dest * (1.0 - glow.a);
++    }
++    // Outer: under the object, outside it.
++    if (knockout) {
++        return glow * (1.0 - dest.a);
++    }
++    return dest + glow * (1.0 - dest.a);
++}
 diff --git a/render/wgpu/shaders/gradient.wgsl b/render/wgpu/shaders/gradient.wgsl
 index 6851e4415cd8890bb18d85273edca62fe7687f10..c242d8176ffba23871cdc9e29f2dfd86f7082c66 100644
 --- a/render/wgpu/shaders/gradient.wgsl
@@ -28282,7 +29923,7 @@ index 0000000000000000000000000000000000000000..d11a4f38ef74a5509e4af67ed1a36d59
 +    }
 +}
 diff --git a/render/wgpu/src/backend.rs b/render/wgpu/src/backend.rs
-index 0e6995e2b401d64b541c59ee75c7f2b4d7d90b8e..2d4f4a17da32d9faa05b89ab2d5a6eb785f5a0dc 100644
+index 0e6995e2b401d64b541c59ee75c7f2b4d7d90b8e..6999e3576802206f326e54f02984ff02da901d12 100644
 --- a/render/wgpu/src/backend.rs
 +++ b/render/wgpu/src/backend.rs
 @@ -1,10 +1,10 @@
@@ -29652,7 +31293,7 @@ index 0e6995e2b401d64b541c59ee75c7f2b4d7d90b8e..2d4f4a17da32d9faa05b89ab2d5a6eb7
      Ok((adapter, device, queue))
  }
  
-@@ -1242,13 +2091,38 @@ async fn request_device(
+@@ -1242,13 +2091,39 @@ async fn request_device(
              label: None,
              required_features: features,
              required_limits: limits,
@@ -29686,13 +31327,14 @@ index 0e6995e2b401d64b541c59ee75c7f2b4d7d90b8e..2d4f4a17da32d9faa05b89ab2d5a6eb7
 +            | Filter::ShaderFilter(_)
 +            | Filter::BevelFilter(_)
 +            | Filter::DisplacementMapFilter(_)
++            | Filter::GradientGlowFilter(_)
 +    )
 +}
 +
  /// Determines how we choose our frame buffer
  #[derive(Clone)]
  pub enum RenderTargetMode {
-@@ -1276,10 +2150,99 @@ impl RenderTargetMode {
+@@ -1276,10 +2151,99 @@ impl RenderTargetMode {
      }
  }
  
@@ -29792,7 +31434,7 @@ index 0e6995e2b401d64b541c59ee75c7f2b4d7d90b8e..2d4f4a17da32d9faa05b89ab2d5a6eb7
  }
  
  impl ActiveFrame {
-@@ -1292,15 +2255,44 @@ impl ActiveFrame {
+@@ -1292,15 +2256,44 @@ impl ActiveFrame {
                  .create_command_encoder(&Default::default()),
              staging_belt: wgpu::util::StagingBelt::new(descriptors.device.clone(), 65536),
              draws_since_flush: 0,
@@ -29839,7 +31481,7 @@ index 0e6995e2b401d64b541c59ee75c7f2b4d7d90b8e..2d4f4a17da32d9faa05b89ab2d5a6eb7
          self.draws_since_flush = 0;
          self.staging_belt.finish();
          let draw_encoder = std::mem::replace(
-@@ -1309,17 +2301,92 @@ impl ActiveFrame {
+@@ -1309,17 +2302,92 @@ impl ActiveFrame {
                  .device
                  .create_command_encoder(&Default::default()),
          );
@@ -29939,7 +31581,7 @@ index 0e6995e2b401d64b541c59ee75c7f2b4d7d90b8e..2d4f4a17da32d9faa05b89ab2d5a6eb7
          self.draws_since_flush = 0;
          self.staging_belt.finish();
          let draw_encoder = std::mem::replace(
-@@ -1328,7 +2395,19 @@ impl ActiveFrame {
+@@ -1328,7 +2396,19 @@ impl ActiveFrame {
                  .device
                  .create_command_encoder(&Default::default()),
          );
@@ -29960,7 +31602,7 @@ index 0e6995e2b401d64b541c59ee75c7f2b4d7d90b8e..2d4f4a17da32d9faa05b89ab2d5a6eb7
          self.staging_belt.recall();
          index
      }
-@@ -1345,3 +2424,292 @@ impl ActiveFrame {
+@@ -1345,3 +2425,292 @@ impl ActiveFrame {
          }
      }
  }
@@ -31479,16 +33121,30 @@ index 0000000000000000000000000000000000000000..79519054dc603334f8cfaa7404137246
 +    }
 +}
 diff --git a/render/wgpu/src/filters.rs b/render/wgpu/src/filters.rs
-index ecd34ce50e3c7ee09bf1fbea0c10fb3e6ba23a04..ca8d3b82d60bf6455c5bb3dfb69d75dc29ef5474 100644
+index ecd34ce50e3c7ee09bf1fbea0c10fb3e6ba23a04..700067f43ce223661d90481a23c04ee373d9c46a 100644
 --- a/render/wgpu/src/filters.rs
 +++ b/render/wgpu/src/filters.rs
-@@ -1,4 +1,5 @@
+@@ -1,9 +1,11 @@
  mod bevel;
 +pub mod batch;
  mod blur;
  mod color_matrix;
  mod displacement_map;
-@@ -185,6 +186,51 @@ impl<'a> FilterSource<'a> {
+ mod drop_shadow;
+ mod glow;
++mod gradient_glow;
+ mod shader;
+ 
+ use std::collections::HashSet;
+@@ -17,6 +19,7 @@ use crate::filters::color_matrix::ColorMatrixFilter;
+ use crate::filters::displacement_map::DisplacementMapFilter;
+ use crate::filters::drop_shadow::DropShadowFilter;
+ use crate::filters::glow::GlowFilter;
++use crate::filters::gradient_glow::GradientGlowFilter;
+ use crate::filters::shader::ShaderFilter;
+ use crate::surface::target::CommandTarget;
+ use bytemuck::{Pod, Zeroable};
+@@ -185,13 +188,62 @@ impl<'a> FilterSource<'a> {
      }
  }
  
@@ -31540,18 +33196,22 @@ index ecd34ce50e3c7ee09bf1fbea0c10fb3e6ba23a04..ca8d3b82d60bf6455c5bb3dfb69d75dc
  pub struct Filters {
      pub blur: BlurFilter,
      pub color_matrix: ColorMatrixFilter,
-@@ -192,6 +238,8 @@ pub struct Filters {
+     pub shader: ShaderFilter,
      pub glow: GlowFilter,
      pub bevel: BevelFilter,
++    /// AQW build: see `filters::gradient_glow`.
++    pub gradient_glow: GradientGlowFilter,
      pub displacement_map: DisplacementMapFilter,
 +    /// AQW build: batched blur/glow (see `filters::batch`).
 +    pub batch: batch::FilterBatch,
  }
  
  impl Filters {
-@@ -203,6 +251,20 @@ impl Filters {
+@@ -202,7 +254,23 @@ impl Filters {
+             shader: ShaderFilter::new(),
              glow: GlowFilter::new(device),
              bevel: BevelFilter::new(device),
++            gradient_glow: GradientGlowFilter::new(device),
              displacement_map: DisplacementMapFilter::new(device),
 +            batch: batch::FilterBatch::new(device),
 +        }
@@ -31562,6 +33222,7 @@ index ecd34ce50e3c7ee09bf1fbea0c10fb3e6ba23a04..ca8d3b82d60bf6455c5bb3dfb69d75dc
 +        self.blur.pipeline(descriptors, msaa_sample_count);
 +        self.glow.pipeline(descriptors, msaa_sample_count);
 +        self.bevel.pipeline(descriptors, msaa_sample_count);
++        self.gradient_glow.pipeline(descriptors, msaa_sample_count);
 +        self.color_matrix.pipeline(descriptors, msaa_sample_count);
 +        self.displacement_map
 +            .pipeline(descriptors, msaa_sample_count);
@@ -31570,7 +33231,7 @@ index ecd34ce50e3c7ee09bf1fbea0c10fb3e6ba23a04..ca8d3b82d60bf6455c5bb3dfb69d75dc
          }
      }
  
-@@ -215,6 +277,7 @@ impl Filters {
+@@ -215,6 +283,7 @@ impl Filters {
          source: FilterSource,
          filter: Filter,
      ) -> CommandTarget {
@@ -31578,6 +33239,36 @@ index ecd34ce50e3c7ee09bf1fbea0c10fb3e6ba23a04..ca8d3b82d60bf6455c5bb3dfb69d75dc
          let target = match filter {
              Filter::ColorMatrixFilter(filter) => Some(descriptors.filters.color_matrix.apply(
                  descriptors,
+@@ -268,6 +337,15 @@ impl Filters {
+                 &filter,
+                 &self.blur,
+             )),
++            Filter::GradientGlowFilter(filter) => Some(descriptors.filters.gradient_glow.apply(
++                descriptors,
++                texture_pool,
++                draw_encoder,
++                staging_belt,
++                &source,
++                &filter,
++                &self.blur,
++            )),
+             Filter::DisplacementMapFilter(filter) => descriptors.filters.displacement_map.apply(
+                 descriptors,
+                 texture_pool,
+@@ -281,12 +359,12 @@ impl Filters {
+                     LazyLock::new(Default::default);
+ 
+                 let name = match filter {
+-                    Filter::GradientGlowFilter(_) => "GradientGlowFilter",
+                     Filter::GradientBevelFilter(_) => "GradientBevelFilter",
+                     Filter::ConvolutionFilter(_) => "ConvolutionFilter",
+                     Filter::ColorMatrixFilter(_)
+                     | Filter::BlurFilter(_)
+                     | Filter::GlowFilter(_)
++                    | Filter::GradientGlowFilter(_)
+                     | Filter::DropShadowFilter(_)
+                     | Filter::BevelFilter(_)
+                     | Filter::DisplacementMapFilter(_)
 diff --git a/render/wgpu/src/filters/batch.rs b/render/wgpu/src/filters/batch.rs
 new file mode 100644
 index 0000000000000000000000000000000000000000..d458ce64838e5312c7dbdfac07ba9e7a16a20cbf
@@ -32262,6 +33953,292 @@ index cd960f0362298c03ab3b2e3a6abbcb17ba8baa4f..e5609bba9a763ffc01cbf5fc8607a2dd
          target
      }
  }
+diff --git a/render/wgpu/src/filters/gradient_glow.rs b/render/wgpu/src/filters/gradient_glow.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..953a42fd802c32480c938fea06799146b0e0aee1
+--- /dev/null
++++ b/render/wgpu/src/filters/gradient_glow.rs
+@@ -0,0 +1,280 @@
++//! AQW build: the gradient glow filter (`GradientGlowFilter`), which stock Ruffle skipped
++//! ("Unsupported filter"): AQW's /spellcraft rune words glow red or green with it.
++//!
++//! Flash draws it as a drop shadow (the object's alpha, blurred, moved by `distance` at
++//! `angle`) whose color comes from a lookup table instead of one color: the blurred alpha
++//! times `strength` (clamped to 0..1) picks one of the 256 entries of the filter's gradient,
++//! made from its colors, alphas and ratios as a gradient fill's ramp is. Like a bevel, it's
++//! "outer" (under the object, outside it), "inner" (inside it, from the inverted alpha) or
++//! "full" (everywhere, on top of the object); "knockout" leaves the object itself out.
++//! `quality` is the number of blur passes, as for the other filters.
++
++use crate::backend::RenderTargetMode;
++use crate::buffer_pool::TexturePool;
++use crate::descriptors::Descriptors;
++use crate::filters::blur::BlurFilter;
++use crate::filters::{
++    FilterSource, FilterVertexWithBlur, VERTEX_BUFFERS_DESCRIPTION_FILTERS_WITH_BLUR,
++};
++use crate::surface::target::CommandTarget;
++use crate::utils::SampleCountMap;
++use bytemuck::{Pod, Zeroable};
++use std::sync::OnceLock;
++use swf::GradientFilter as GradientFilterArgs;
++use wgpu::util::StagingBelt;
++
++#[repr(C)]
++#[derive(Copy, Clone, Debug, Pod, Zeroable, PartialEq)]
++struct GradientGlowUniform {
++    /// The 256-entry lookup table, RGBA8 (not premultiplied), four entries per vector.
++    ramp: [[u32; 4]; 64],
++    strength: f32,
++    /// 0: outer, 1: inner, 2: full.
++    glow_type: u32,
++    knockout: u32,
++    _padding: u32,
++}
++
++pub struct GradientGlowFilter {
++    bind_group_layout: wgpu::BindGroupLayout,
++    pipeline_layout: wgpu::PipelineLayout,
++    vertex_buffer: wgpu::Buffer,
++    uniform_buffer: wgpu::Buffer,
++    vertices_size: wgpu::BufferSize,
++    uniform_size: wgpu::BufferSize,
++    pipeline: SampleCountMap<OnceLock<wgpu::RenderPipeline>>,
++}
++
++impl GradientGlowFilter {
++    pub fn new(device: &wgpu::Device) -> Self {
++        let uniform_size = std::mem::size_of::<GradientGlowUniform>() as u64;
++        let texture_entry = |binding| wgpu::BindGroupLayoutEntry {
++            binding,
++            visibility: wgpu::ShaderStages::FRAGMENT,
++            ty: wgpu::BindingType::Texture {
++                multisampled: false,
++                sample_type: wgpu::TextureSampleType::Float { filterable: false },
++                view_dimension: wgpu::TextureViewDimension::D2,
++            },
++            count: None,
++        };
++        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++            entries: &[
++                texture_entry(0),
++                wgpu::BindGroupLayoutEntry {
++                    binding: 1,
++                    visibility: wgpu::ShaderStages::FRAGMENT,
++                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
++                    count: None,
++                },
++                wgpu::BindGroupLayoutEntry {
++                    binding: 2,
++                    visibility: wgpu::ShaderStages::FRAGMENT,
++                    ty: wgpu::BindingType::Buffer {
++                        ty: wgpu::BufferBindingType::Uniform,
++                        has_dynamic_offset: false,
++                        min_binding_size: wgpu::BufferSize::new(uniform_size),
++                    },
++                    count: None,
++                },
++                texture_entry(3),
++            ],
++            label: create_debug_label!("Gradient glow filter binds").as_deref(),
++        });
++
++        let vertices_size = std::mem::size_of::<[FilterVertexWithBlur; 4]>() as u64;
++        let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
++            label: None,
++            size: vertices_size,
++            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
++            mapped_at_creation: false,
++        });
++        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
++            label: None,
++            size: uniform_size,
++            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
++            mapped_at_creation: false,
++        });
++        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++            label: None,
++            bind_group_layouts: &[Some(&bind_group_layout)],
++            immediate_size: 0,
++        });
++
++        Self {
++            pipeline: Default::default(),
++            pipeline_layout,
++            vertex_buffer,
++            uniform_buffer,
++            bind_group_layout,
++            uniform_size: wgpu::BufferSize::new(uniform_size).expect("Definitely not zero."),
++            vertices_size: wgpu::BufferSize::new(vertices_size).expect("Definitely not zero."),
++        }
++    }
++
++    pub(crate) fn pipeline(
++        &self,
++        descriptors: &Descriptors,
++        msaa_sample_count: u32,
++    ) -> &wgpu::RenderPipeline {
++        self.pipeline.get_or_init(msaa_sample_count, || {
++            let _timer = crate::perf_counters::timers::Scoped::new(
++                crate::perf_counters::timers::PIPELINE,
++            );
++            let label = create_debug_label!("Gradient Glow Filter ({} msaa)", msaa_sample_count);
++            descriptors
++                .device
++                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++                    label: label.as_deref(),
++                    layout: Some(&self.pipeline_layout),
++                    vertex: wgpu::VertexState {
++                        module: &descriptors.shaders.gradient_glow_filter,
++                        entry_point: Some("main_vertex"),
++                        buffers: &VERTEX_BUFFERS_DESCRIPTION_FILTERS_WITH_BLUR,
++                        compilation_options: Default::default(),
++                    },
++                    primitive: wgpu::PrimitiveState {
++                        topology: wgpu::PrimitiveTopology::TriangleList,
++                        strip_index_format: None,
++                        front_face: wgpu::FrontFace::Ccw,
++                        cull_mode: None,
++                        polygon_mode: wgpu::PolygonMode::default(),
++                        unclipped_depth: false,
++                        conservative: false,
++                    },
++                    depth_stencil: None,
++                    multisample: wgpu::MultisampleState {
++                        count: msaa_sample_count,
++                        mask: !0,
++                        alpha_to_coverage_enabled: false,
++                    },
++                    fragment: Some(wgpu::FragmentState {
++                        module: &descriptors.shaders.gradient_glow_filter,
++                        entry_point: Some("main_fragment"),
++                        targets: &[Some(wgpu::TextureFormat::Rgba8Unorm.into())],
++                        compilation_options: Default::default(),
++                    }),
++                    multiview_mask: None,
++                    cache: None,
++                })
++        })
++    }
++
++    #[expect(clippy::too_many_arguments)]
++    pub fn apply(
++        &self,
++        descriptors: &Descriptors,
++        texture_pool: &mut TexturePool,
++        draw_encoder: &mut wgpu::CommandEncoder,
++        staging_belt: &mut StagingBelt,
++        source: &FilterSource,
++        filter: &GradientFilterArgs,
++        blur_filter: &BlurFilter,
++    ) -> CommandTarget {
++        let sample_count = source.texture.sample_count();
++        let format = source.texture.format();
++        let pipeline = self.pipeline(descriptors, sample_count);
++        let blurred = blur_filter.apply(
++            descriptors,
++            texture_pool,
++            draw_encoder,
++            staging_belt,
++            source,
++            &filter.inner_blur_filter(),
++        );
++        let blurred_texture = if let Some(blurred) = &blurred {
++            blurred.ensure_cleared(draw_encoder);
++            blurred.color_texture()
++        } else {
++            source.texture
++        };
++        let source_view = source.texture.create_view(&Default::default());
++        let blurred_view = blurred_texture.create_view(&Default::default());
++
++        let target = CommandTarget::new(
++            descriptors,
++            texture_pool,
++            wgpu::Extent3d {
++                width: source.size.0,
++                height: source.size.1,
++                depth_or_array_layers: 1,
++            },
++            format,
++            sample_count,
++            RenderTargetMode::FreshWithColor(wgpu::Color::TRANSPARENT),
++            draw_encoder,
++        );
++
++        let bytes = crate::mesh::ramp_of(&filter.colors, swf::GradientInterpolation::Rgb);
++        let mut ramp = [[0u32; 4]; 64];
++        for (i, entry) in bytes.chunks_exact(4).enumerate() {
++            ramp[i / 4][i % 4] = u32::from_le_bytes([entry[0], entry[1], entry[2], entry[3]]);
++        }
++        let glow_type = if filter.is_on_top() {
++            2
++        } else if filter.is_inner() {
++            1
++        } else {
++            0
++        };
++        staging_belt
++            .write_buffer(draw_encoder, &self.uniform_buffer, 0, self.uniform_size)
++            .copy_from_slice(bytemuck::cast_slice(&[GradientGlowUniform {
++                ramp,
++                strength: filter.strength.to_f32(),
++                glow_type,
++                knockout: u32::from(filter.is_knockout()),
++                _padding: 0,
++            }]));
++        // The shadow's offset, as `DropShadowFilter` does it.
++        let distance = filter.distance.to_f32();
++        let angle = filter.angle.to_f32();
++        let blur_offset = (-(angle.cos() * distance), -(angle.sin() * distance));
++        staging_belt
++            .write_buffer(draw_encoder, &self.vertex_buffer, 0, self.vertices_size)
++            .copy_from_slice(bytemuck::cast_slice(&[
++                source.vertices_with_blur_offset(blur_offset)
++            ]));
++        let filter_group = descriptors
++            .device
++            .create_bind_group(&wgpu::BindGroupDescriptor {
++                label: create_debug_label!("Filter group").as_deref(),
++                layout: &self.bind_group_layout,
++                entries: &[
++                    wgpu::BindGroupEntry {
++                        binding: 0,
++                        resource: wgpu::BindingResource::TextureView(&source_view),
++                    },
++                    wgpu::BindGroupEntry {
++                        binding: 1,
++                        resource: wgpu::BindingResource::Sampler(
++                            descriptors.bitmap_samplers.get_sampler(false, false),
++                        ),
++                    },
++                    wgpu::BindGroupEntry {
++                        binding: 2,
++                        resource: self.uniform_buffer.as_entire_binding(),
++                    },
++                    wgpu::BindGroupEntry {
++                        binding: 3,
++                        resource: wgpu::BindingResource::TextureView(&blurred_view),
++                    },
++                ],
++            });
++        crate::perf_counters::inc(crate::perf_counters::RENDER_PASS);
++        let mut render_pass = draw_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++            label: create_debug_label!("Gradient glow filter").as_deref(),
++            color_attachments: &[target.color_attachments()],
++            ..Default::default()
++        });
++        render_pass.set_pipeline(pipeline);
++        render_pass.set_bind_group(0, &filter_group, &[]);
++        render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
++        render_pass.set_index_buffer(
++            descriptors.quad.indices.slice(..),
++            wgpu::IndexFormat::Uint32,
++        );
++        render_pass.draw_indexed(0..6, 0, 0..1);
++        target
++    }
++}
 diff --git a/render/wgpu/src/layer_cache.rs b/render/wgpu/src/layer_cache.rs
 new file mode 100644
 index 0000000000000000000000000000000000000000..d892fb38e445f19722c69116ecd8cb30cdd9f4d1
@@ -33536,7 +35513,7 @@ index b6fc744b70697a968876ab39ea54f51e6b91e647..7c3bfd630bb126bff0e4ddae51ecc5af
 +    f()
 +}
 diff --git a/render/wgpu/src/mesh.rs b/render/wgpu/src/mesh.rs
-index bb2058f913702ca30b6704c91aa1b1f873cfe554..a1697a52845b6200c53237578b47c8143d0267ee 100644
+index bb2058f913702ca30b6704c91aa1b1f873cfe554..ee23d4eb1beeebacba5a48a91790b0ce9e5c0ed8 100644
 --- a/render/wgpu/src/mesh.rs
 +++ b/render/wgpu/src/mesh.rs
 @@ -1,15 +1,17 @@
@@ -33836,7 +35813,7 @@ index bb2058f913702ca30b6704c91aa1b1f873cfe554..a1697a52845b6200c53237578b47c814
          }
      }
  }
-@@ -247,79 +263,116 @@ pub enum DrawType {
+@@ -247,79 +263,123 @@ pub enum DrawType {
      Bitmap { binds: BitmapBinds },
  }
  
@@ -33880,14 +35857,23 @@ index bb2058f913702ca30b6704c91aa1b1f873cfe554..a1697a52845b6200c53237578b47c814
 +
 +/// The gradient's 256-pixel RGBA ramp (what stock Ruffle made a texture of per gradient).
 +fn ramp(gradient: &Gradient) -> [u8; GRADIENT_SIZE * 4] {
-+    if gradient.records.is_empty() {
++    ramp_of(&gradient.records, gradient.interpolation)
++}
++
++/// AQW build: `ramp` of the records alone (also the lookup table of a gradient glow filter,
++/// see `filters::gradient_glow`).
++pub(crate) fn ramp_of(
++    records: &[swf::GradientRecord],
++    interpolation: GradientInterpolation,
++) -> [u8; GRADIENT_SIZE * 4] {
++    if records.is_empty() {
 +        [0; GRADIENT_SIZE * 4]
 +    } else {
 +        let mut colors = [0; GRADIENT_SIZE * 4];
 +        let mut last = 0;
 +        let mut next;
 +
-+        let convert = if gradient.interpolation == GradientInterpolation::LinearRgb {
++        let convert = if interpolation == GradientInterpolation::LinearRgb {
 +            |c| srgb_to_linear(c / 255.0) * 255.0
          } else {
 -            let mut colors = [0; GRADIENT_SIZE * 4];
@@ -33899,17 +35885,15 @@ index bb2058f913702ca30b6704c91aa1b1f873cfe554..a1697a52845b6200c53237578b47c814
 -            let convert = if gradient.interpolation == GradientInterpolation::LinearRgb {
 -                |c| srgb_to_linear(c / 255.0) * 255.0
 +        for t in 0..GRADIENT_SIZE {
-+            if last + 1 < gradient.records.len()
-+                && t > gradient.records[last + 1].ratio as usize
-+            {
++            if last + 1 < records.len() && t > records[last + 1].ratio as usize {
 +                last += 1;
 +            }
-+            next = (last + 1).min(gradient.records.len() - 1);
++            next = (last + 1).min(records.len() - 1);
 +
 +            assert!(last == next || last + 1 == next);
 +
-+            let last_record = &gradient.records[last];
-+            let next_record = &gradient.records[next];
++            let last_record = &records[last];
++            let next_record = &records[next];
 +
 +            let a = if t <= last_record.ratio as usize || last_record.ratio == next_record.ratio
 +            {
@@ -34018,7 +36002,7 @@ index bb2058f913702ca30b6704c91aa1b1f873cfe554..a1697a52845b6200c53237578b47c814
          let texture = descriptors.device.create_texture_with_data(
              &descriptors.queue,
              &wgpu::TextureDescriptor {
-@@ -337,19 +390,74 @@ impl CommonGradient {
+@@ -337,19 +397,74 @@ impl CommonGradient {
                  view_formats: &[],
              },
              wgpu::util::TextureDataOrder::LayerMajor,
@@ -35637,7 +37621,7 @@ index 0000000000000000000000000000000000000000..50cd2912c408ab9017144c13a99b009f
 +    encoders.into_par_iter().map(|e| e.finish()).collect()
 +}
 diff --git a/render/wgpu/src/shaders.rs b/render/wgpu/src/shaders.rs
-index cfcdda97917d5cf9781b71509d440aa9f53e3a42..9db91ad17233ee071aecd8ba8f6d5d6eb8009cb8 100644
+index cfcdda97917d5cf9781b71509d440aa9f53e3a42..96d431f8232c0734c66c33fef268d0cc8f0e1fd3 100644
 --- a/render/wgpu/src/shaders.rs
 +++ b/render/wgpu/src/shaders.rs
 @@ -1,6 +1,6 @@
@@ -35649,7 +37633,7 @@ index cfcdda97917d5cf9781b71509d440aa9f53e3a42..9db91ad17233ee071aecd8ba8f6d5d6e
  use ruffle_render::shader_source::SHADER_FILTER_COMMON;
  
  #[derive(Debug)]
-@@ -17,11 +17,18 @@ pub struct Shaders {
+@@ -17,11 +17,20 @@ pub struct Shaders {
      pub copy_shader: wgpu::ShaderModule,
      pub alpha_mask_shader: wgpu::ShaderModule,
      pub blend_shaders: EnumMap<ComplexBlend, wgpu::ShaderModule>,
@@ -35661,6 +37645,8 @@ index cfcdda97917d5cf9781b71509d440aa9f53e3a42..9db91ad17233ee071aecd8ba8f6d5d6e
      pub blur_filter: wgpu::ShaderModule,
      pub glow_filter: wgpu::ShaderModule,
      pub bevel_filter: wgpu::ShaderModule,
++    /// AQW build: see `filters::gradient_glow`.
++    pub gradient_glow_filter: wgpu::ShaderModule,
      pub displacement_map_filter: wgpu::ShaderModule,
 +    /// AQW build: see `filters::batch`.
 +    pub batch_blur_filter: wgpu::ShaderModule,
@@ -35668,7 +37654,17 @@ index cfcdda97917d5cf9781b71509d440aa9f53e3a42..9db91ad17233ee071aecd8ba8f6d5d6e
  }
  
  impl Shaders {
-@@ -70,6 +77,18 @@ impl Shaders {
+@@ -65,11 +74,28 @@ impl Shaders {
+             "filter/bevel.wgsl",
+             include_str!("../shaders/filter/bevel.wgsl"),
+         );
++        let gradient_glow_filter = make_filter_shader(
++            device,
++            "filter/gradient_glow.wgsl",
++            include_str!("../shaders/filter/gradient_glow.wgsl"),
++        );
+         let displacement_map_filter = make_filter_shader(
+             device,
              "filter/displacement_map.wgsl",
              include_str!("../shaders/filter/displacement_map.wgsl"),
          );
@@ -35687,7 +37683,7 @@ index cfcdda97917d5cf9781b71509d440aa9f53e3a42..9db91ad17233ee071aecd8ba8f6d5d6e
          let gradient_shader = make_shader(
              device,
              "gradient.wgsl",
-@@ -83,17 +102,9 @@ impl Shaders {
+@@ -83,17 +109,9 @@ impl Shaders {
              max_transforms,
          );
  
@@ -35708,7 +37704,7 @@ index cfcdda97917d5cf9781b71509d440aa9f53e3a42..9db91ad17233ee071aecd8ba8f6d5d6e
  
          Self {
              color_shader,
-@@ -102,15 +113,93 @@ impl Shaders {
+@@ -102,15 +120,94 @@ impl Shaders {
              copy_shader,
              alpha_mask_shader,
              blend_shaders,
@@ -35718,6 +37714,7 @@ index cfcdda97917d5cf9781b71509d440aa9f53e3a42..9db91ad17233ee071aecd8ba8f6d5d6e
              blur_filter,
              glow_filter,
              bevel_filter,
++            gradient_glow_filter,
              displacement_map_filter,
 +            batch_blur_filter,
 +            batch_glow_filter,
@@ -35802,7 +37799,7 @@ index cfcdda97917d5cf9781b71509d440aa9f53e3a42..9db91ad17233ee071aecd8ba8f6d5d6e
  fn make_shader(
      device: &wgpu::Device,
      name: &str,
-@@ -131,3 +220,60 @@ fn make_filter_shader(device: &wgpu::Device, name: &str, source: &str) -> wgpu::
+@@ -131,3 +228,60 @@ fn make_filter_shader(device: &wgpu::Device, name: &str, source: &str) -> wgpu::
          source: wgpu::ShaderSource::Wgsl(format!("{SHADER_FILTER_COMMON}\n{source}").into()),
      })
  }
@@ -41165,6 +43162,44 @@ index 52b14a465cd2fb56f1d48991297e7a63eff476a9..0c13753f292c5d7928f89ca08bf9fbf3
      drop(render_pass);
  }
  
+diff --git a/swf/src/types/gradient_filter.rs b/swf/src/types/gradient_filter.rs
+index a48df71869e0eef58bbda9368c90a508ba7629bc..d24cdadde86ec02b4465ae5d7cf7038567e35ca4 100644
+--- a/swf/src/types/gradient_filter.rs
++++ b/swf/src/types/gradient_filter.rs
+@@ -1,4 +1,4 @@
+-use crate::{BlurFilter, BlurFilterFlags, Fixed8, Fixed16, GradientRecord};
++use crate::{BlurFilter, BlurFilterFlags, Fixed8, Fixed16, GradientRecord, Rectangle, Twips};
+ use bitflags::bitflags;
+ 
+ #[derive(Clone, Debug, Eq, PartialEq)]
+@@ -39,6 +39,27 @@ impl GradientFilter {
+         self.distance *= Fixed16::from_f32(y);
+     }
+ 
++    /// The area a gradient glow draws into: its blur's, moved like a drop shadow's (as
++    /// `DropShadowFilter::calculate_dest_rect`).
++    pub fn calculate_dest_rect(&self, source_rect: Rectangle<Twips>) -> Rectangle<Twips> {
++        let mut result = self.inner_blur_filter().calculate_dest_rect(source_rect);
++        let distance = self.distance.to_f64();
++        let angle = self.angle.to_f64();
++        let x = Twips::from_pixels(angle.cos() * distance);
++        let y = Twips::from_pixels(angle.sin() * distance);
++        if x < Twips::ZERO {
++            result.x_min += x;
++        } else {
++            result.x_max += x;
++        }
++        if y < Twips::ZERO {
++            result.y_min += y;
++        } else {
++            result.y_max += y;
++        }
++        result
++    }
++
+     pub fn inner_blur_filter(&self) -> BlurFilter {
+         BlurFilter {
+             blur_x: self.blur_x,
 diff --git a/tests/framework/src/runner.rs b/tests/framework/src/runner.rs
 index 12c46d44353418a09cc37f603689467b77b72b17..d04d1a9c281b0edb37c34420f4bc6f3d0b3ae68b 100644
 --- a/tests/framework/src/runner.rs
