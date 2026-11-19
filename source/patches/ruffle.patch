@@ -3234,7 +3234,7 @@ index 91557eaff7a20ca2b10477c3d8f74e8a6dddd788..f7a82ee0639c59b5c92fffe4d7d36d62
              .map(|(name, ns, prop)| (name.as_wstr().to_utf8_lossy(), ns, *prop))
              .collect();
 diff --git a/core/src/display_object.rs b/core/src/display_object.rs
-index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf17e41d1e 100644
+index 2425006896842d5dcd14a3e9e683481eddf6f8de..730f8647378bacf327f53c7229fe70d2d0553971 100644
 --- a/core/src/display_object.rs
 +++ b/core/src/display_object.rs
 @@ -32,11 +32,15 @@ mod avm2_button;
@@ -3306,7 +3306,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
  
          if renderer.is_offscreen_supported()
              && let Some(actual_width) = NonZero::new(actual_width)
-@@ -194,6 +217,51 @@ impl BitmapCache {
+@@ -194,6 +217,67 @@ impl BitmapCache {
      }
  }
  
@@ -3344,12 +3344,28 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
 +    }
 +}
 +
-+/// AQW build: whether a cached object too big for Flash's limits is drawn smaller instead of
-+/// without its cache and filters (Flash's own behaviour, kept with `RUFFLE_FLASH_CACHE_LIMITS=1`).
++/// AQW build: whether a cached object too big for Flash's limits on a screen bigger than
++/// `REFERENCE_VIEW_SCALE` is drawn smaller instead of without its cache and filters (see
++/// `cache_reduction`). On with `RUFFLE_CACHE_REDUCTION` (Mugetsu sets it when AQW is played;
++/// the file `no-cache-reduction` next to its exe leaves it out).
 +fn cache_reduction_enabled() -> bool {
 +    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-+    *ENABLED.get_or_init(|| std::env::var("RUFFLE_FLASH_CACHE_LIMITS").as_deref() != Ok("1"))
++    *ENABLED.get_or_init(|| std::env::var_os("RUFFLE_CACHE_REDUCTION").is_some())
 +}
++
++/// AQW build: the stage scale up to which Flash's limits are followed as they are: what AQW's
++/// 960x550 stage is drawn at on a 1920x1080 screen. Up to this size an object too big for the
++/// limits is drawn without its filters, as Flash draws it and as players know the room. Only on
++/// a bigger screen, and only an object that still has its filters at this size, is drawn
++/// smaller to keep them (see `cache_reduction`): a room then looks on a 1440p or 4K screen as it
++/// does on a 1080p one.
++///
++/// Mugetsu 2.0.2 had no such reference: it kept the filters of every object that could be
++/// drawn smaller, at any window size. /ultraalteon got a dark layer and /ultradrakath a black
++/// ground in windows that had never shown them (those shades are 8 million stage pixels and
++/// more: they fit Flash's limits at 960x550 only, and are gone from a stage scale of about
++/// 1.4 on).
++const REFERENCE_VIEW_SCALE: f32 = 2.0;
 +
 +/// AQW build: the smallest reduction used. A picture that would have to be drawn smaller than
 +/// this is skipped as Flash does (such bounds are usually broken, not a real object).
@@ -3358,7 +3374,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
  #[derive(Clone)]
  pub struct RenderOptions {
      /// Whether to skip rendering masks.
-@@ -318,6 +386,18 @@ pub struct DisplayObjectBase<'gc> {
+@@ -318,6 +402,18 @@ pub struct DisplayObjectBase<'gc> {
  
      /// Rectangle used for 9-slice scaling (`DisplayObject.scale9grid`).
      scaling_grid: Cell<Rectangle<Twips>>,
@@ -3377,7 +3393,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
  }
  
  #[derive(Clone)]
-@@ -363,6 +443,9 @@ impl Default for DisplayObjectBase<'_> {
+@@ -363,6 +459,9 @@ impl Default for DisplayObjectBase<'_> {
              scroll_rect: Cell::new(None),
              next_scroll_rect: Default::default(),
              scaling_grid: Default::default(),
@@ -3387,7 +3403,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          }
      }
  }
-@@ -373,6 +456,7 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -373,6 +472,7 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_flag(&self, flag: DisplayObjectFlags, value: bool) {
@@ -3395,7 +3411,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          let mut flags = self.flags.get();
          flags.set(flag, value);
          self.flags.set(flags);
-@@ -389,6 +473,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -389,6 +489,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_depth(&self, depth: Depth) {
@@ -3404,7 +3420,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          self.depth.set(depth);
      }
  
-@@ -418,8 +504,17 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -418,8 +520,17 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      pub fn set_matrix(&self, matrix: Matrix) {
@@ -3422,7 +3438,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
      }
  
      pub fn color_transform(&self) -> ColorTransform {
-@@ -427,6 +522,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -427,6 +538,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      pub fn set_color_transform(&self, color_transform: ColorTransform) {
@@ -3431,7 +3447,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          self.color_transform.set(color_transform);
      }
  
-@@ -438,6 +535,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -438,6 +551,8 @@ impl<'gc> DisplayObjectBase<'gc> {
          &self,
          perspective_projection: Option<PerspectiveProjection>,
      ) -> bool {
@@ -3440,7 +3456,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          let old = self.perspective_projection.replace(perspective_projection);
          perspective_projection != old
      }
-@@ -447,10 +546,13 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -447,10 +562,13 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_x(&self, x: Twips) -> bool {
@@ -3454,7 +3470,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          self.set_transformed_by_script(true);
          changed
      }
-@@ -460,10 +562,13 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -460,10 +578,13 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_y(&self, y: Twips) -> bool {
@@ -3468,7 +3484,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          self.set_transformed_by_script(true);
          changed
      }
-@@ -473,6 +578,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -473,6 +594,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_z(&self, tz: f64) -> bool {
@@ -3477,7 +3493,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          let changed = self.tz.get() != tz;
          self.set_transformed_by_script(true);
          self.tz.set(tz);
-@@ -521,6 +628,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -521,6 +644,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_rotation(&self, degrees: Degrees) -> bool {
@@ -3486,7 +3502,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          self.set_transformed_by_script(true);
          self.cache_scale_rotation();
          let changed = self.rotation.get() != degrees;
-@@ -552,6 +661,7 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -552,6 +677,7 @@ impl<'gc> DisplayObjectBase<'gc> {
          matrix.c = (scale_y * -sin_y) as f32;
          matrix.d = (scale_y * cos_y) as f32;
          self.matrix.set(matrix);
@@ -3494,7 +3510,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
  
          changed
      }
-@@ -562,6 +672,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -562,6 +688,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_scale_x(&self, mut value: Percent) -> bool {
@@ -3503,7 +3519,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          let changed = self.scale_x.get() != value;
          self.set_transformed_by_script(true);
          self.cache_scale_rotation();
-@@ -587,6 +699,7 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -587,6 +715,7 @@ impl<'gc> DisplayObjectBase<'gc> {
          matrix.a = (cos * value.unit()) as f32;
          matrix.b = (sin * value.unit()) as f32;
          self.matrix.set(matrix);
@@ -3511,7 +3527,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
  
          changed
      }
-@@ -597,6 +710,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -597,6 +726,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_scale_y(&self, mut value: Percent) -> bool {
@@ -3520,7 +3536,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          let changed = self.scale_y.get() != value;
          self.set_transformed_by_script(true);
          self.cache_scale_rotation();
-@@ -623,6 +738,7 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -623,6 +754,7 @@ impl<'gc> DisplayObjectBase<'gc> {
          matrix.c = (-sin * value.unit()) as f32;
          matrix.d = (cos * value.unit()) as f32;
          self.matrix.set(matrix);
@@ -3528,7 +3544,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
  
          changed
      }
-@@ -640,6 +756,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -640,6 +772,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_filters(&self, filters: Box<[Filter]>) -> bool {
@@ -3537,7 +3553,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          let mut write = self.cell.borrow_mut();
          let changed = filters != write.filters;
          write.filters = filters;
-@@ -655,6 +773,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -655,6 +789,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_alpha(&self, value: f64) -> bool {
@@ -3546,7 +3562,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          self.set_transformed_by_script(true);
          let value = Fixed8::from_f64(value);
          let mut tf = self.color_transform.get();
-@@ -669,6 +789,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -669,6 +805,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_clip_depth(&self, depth: Depth) {
@@ -3555,7 +3571,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          self.clip_depth.set(depth);
      }
  
-@@ -679,6 +801,16 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -679,6 +817,16 @@ impl<'gc> DisplayObjectBase<'gc> {
      /// You should almost always use `DisplayObject.set_parent` instead, which
      /// properly handles 'orphan' movie clips
      fn set_parent_ignoring_orphan_list(this: &Write<Self>, parent: Option<DisplayObject<'gc>>) {
@@ -3572,7 +3588,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          unlock!(this, Self, parent).set(parent)
      }
  
-@@ -703,6 +835,10 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -703,6 +851,10 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_avm1_pending_removal(&self, value: bool) {
@@ -3583,7 +3599,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          self.set_flag(DisplayObjectFlags::AVM1_PENDING_REMOVAL, value);
      }
  
-@@ -732,7 +868,12 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -732,7 +884,12 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_visible(&self, value: bool) -> bool {
@@ -3596,7 +3612,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          self.set_flag(DisplayObjectFlags::VISIBLE, value);
          changed
      }
-@@ -742,6 +883,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -742,6 +899,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_blend_mode(&self, value: ExtendedBlendMode) -> bool {
@@ -3605,7 +3621,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          self.blend_mode.replace(value) != value
      }
  
-@@ -750,6 +893,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -750,6 +909,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_blend_shader(&self, value: Option<PixelBenderShaderHandle>) {
@@ -3614,7 +3630,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          self.cell.borrow_mut().blend_shader = value;
      }
  
-@@ -764,6 +909,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -764,6 +925,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      /// triggers cache-as-bitmap behavior. Only solid backgrounds are supported; the alpha channel
      /// is ignored.
      fn set_opaque_background(&self, value: Option<Color>) -> bool {
@@ -3623,7 +3639,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          let value = value.map(|mut color| {
              color.a = 255;
              color
-@@ -834,6 +981,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -834,6 +997,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_bitmap_cached_preference(&self, value: bool) {
@@ -3632,7 +3648,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          self.set_flag(DisplayObjectFlags::CACHE_AS_BITMAP, value);
          self.recheck_cache_as_bitmap();
      }
-@@ -848,6 +997,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -848,6 +1013,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      /// Any subsequent calls will return false, indicating that you do not need to invalidate the ancestors.
      /// This is reset during rendering.
      fn invalidate_cached_bitmap(&self) -> bool {
@@ -3641,7 +3657,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          if self.contains_flag(DisplayObjectFlags::CACHE_INVALIDATED) {
              return false;
          }
-@@ -885,6 +1036,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -885,6 +1052,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_has_scroll_rect(&self, value: bool) {
@@ -3650,7 +3666,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          self.set_flag(DisplayObjectFlags::HAS_SCROLL_RECT, value);
      }
  
-@@ -901,6 +1054,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -901,6 +1070,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_masker(this: &Write<Self>, node: Option<DisplayObject<'gc>>) {
@@ -3659,7 +3675,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          unlock!(this, Self, masker).set(node);
      }
  
-@@ -909,6 +1064,8 @@ impl<'gc> DisplayObjectBase<'gc> {
+@@ -909,6 +1080,8 @@ impl<'gc> DisplayObjectBase<'gc> {
      }
  
      fn set_maskee(this: &Write<Self>, node: Option<DisplayObject<'gc>>) {
@@ -3668,7 +3684,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          unlock!(this, Self, maskee).set(node);
      }
  
-@@ -959,10 +1116,15 @@ impl BoundsMode {
+@@ -959,10 +1132,15 @@ impl BoundsMode {
  struct DrawCacheInfo {
      bitmap: BitmapInfo,
      dirty: bool,
@@ -3684,7 +3700,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
  }
  
  pub fn render_base<'gc>(
-@@ -970,13 +1132,63 @@ pub fn render_base<'gc>(
+@@ -970,13 +1148,63 @@ pub fn render_base<'gc>(
      context: &mut RenderContext<'_, 'gc>,
      options: RenderOptions,
  ) {
@@ -3749,7 +3765,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          context.transform_stack.push(&transform);
      }
  
-@@ -986,21 +1198,46 @@ pub fn render_base<'gc>(
+@@ -986,21 +1214,46 @@ pub fn render_base<'gc>(
      } else {
          None
      };
@@ -3801,7 +3817,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
              let width = bounds.width().to_pixels().ceil().max(0.0);
              let height = bounds.height().to_pixels().ceil().max(0.0);
              if width <= u16::MAX as f64 && height <= u16::MAX as f64 {
-@@ -1012,7 +1249,7 @@ pub fn render_base<'gc>(
+@@ -1012,7 +1265,7 @@ pub fn render_base<'gc>(
                      y_min: Twips::ZERO,
                      y_max: Twips::from_pixels_i32(height as i32),
                  };
@@ -3810,7 +3826,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
                  for filter in &mut filters {
                      // Scaling is done by *stage view matrix* only, nothing in-between
                      filter.scale(stage_matrix.a, stage_matrix.d);
-@@ -1025,35 +1262,109 @@ pub fn render_base<'gc>(
+@@ -1025,35 +1278,109 @@ pub fn render_base<'gc>(
                      y_max: filter_rect.y_max.to_pixels().ceil() as i32,
                  };
                  let draw_offset = Point::new(filter_rect.x_min, filter_rect.y_min);
@@ -3923,7 +3939,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
              } else {
                  if !cache.warned_for_oversize {
                      tracing::warn!(
-@@ -1061,11 +1372,16 @@ pub fn render_base<'gc>(
+@@ -1061,11 +1388,16 @@ pub fn render_base<'gc>(
                          name
                      );
                      cache.warned_for_oversize = true;
@@ -3940,7 +3956,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          cache_info
      } else {
          None
-@@ -1080,6 +1396,12 @@ pub fn render_base<'gc>(
+@@ -1080,6 +1412,12 @@ pub fn render_base<'gc>(
              + Twips::from_pixels_i32(cache_info.draw_offset.x);
          let offset_y = cache_info.bounds.y_min - cache_info.base_transform.matrix.ty
              + Twips::from_pixels_i32(cache_info.draw_offset.y);
@@ -3953,7 +3969,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
  
          if cache_info.dirty {
              let mut transform_stack = TransformStack::new();
-@@ -1094,6 +1416,7 @@ pub fn render_base<'gc>(
+@@ -1094,6 +1432,7 @@ pub fn render_base<'gc>(
                  tz: Default::default(),
              });
              let mut offscreen_context = RenderContext {
@@ -3961,7 +3977,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
                  renderer: context.renderer,
                  commands: CommandList::new(),
                  cache_draws: context.cache_draws,
-@@ -1105,12 +1428,41 @@ pub fn render_base<'gc>(
+@@ -1105,12 +1444,41 @@ pub fn render_base<'gc>(
                  use_bitmap_cache: true,
                  stage: context.stage,
              };
@@ -4003,7 +4019,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
              });
          }
  
-@@ -1120,14 +1472,30 @@ pub fn render_base<'gc>(
+@@ -1120,14 +1488,30 @@ pub fn render_base<'gc>(
              context,
              |context| {
                  let region = cache_info.bitmap.full_region();
@@ -4039,7 +4055,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
                          color_transform: cache_info.base_transform.color_transform,
                          perspective_projection: cache_info.base_transform.perspective_projection,
                          tz: cache_info.base_transform.tz,
-@@ -1146,7 +1514,7 @@ pub fn render_base<'gc>(
+@@ -1146,7 +1530,7 @@ pub fn render_base<'gc>(
              let bounds: Rectangle<Twips> = this.render_bounds_with_transform(
                  &context.transform_stack.transform().matrix,
                  true,
@@ -4048,7 +4064,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
              );
              context
                  .commands
-@@ -1161,28 +1529,139 @@ pub fn render_base<'gc>(
+@@ -1161,28 +1545,139 @@ pub fn render_base<'gc>(
      }
  
      if let Some(original_commands) = original_commands {
@@ -4201,7 +4217,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
  }
  
  /// This applies the **standard** method of `mask` and `scrollRect`.
-@@ -1225,10 +1704,18 @@ pub fn apply_standard_mask_and_scroll<'gc, F>(
+@@ -1225,10 +1720,18 @@ pub fn apply_standard_mask_and_scroll<'gc, F>(
      let mask = this.get_render_mask();
      let mut mask_transform = ruffle_render::transform::Transform::default();
      if let RenderMask::Stencil(m) | RenderMask::Alpha(m) = mask {
@@ -4223,7 +4239,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
      }
      if let RenderMask::Stencil(m) = mask {
          context.commands.push_mask();
-@@ -1517,7 +2004,75 @@ pub trait TDisplayObject<'gc>:
+@@ -1517,7 +2020,75 @@ pub trait TDisplayObject<'gc>:
      /// Returns the matrix for transforming from this object's local space to global stage space,
      /// without applying the translation of this object's own scroll rect.
      #[no_dynamic]
@@ -4299,7 +4315,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          let mut node = self.parent();
          let mut matrix = self.base().matrix();
          while let Some(display_object) = node {
-@@ -1953,6 +2508,10 @@ pub trait TDisplayObject<'gc>:
+@@ -1953,6 +2524,10 @@ pub trait TDisplayObject<'gc>:
      /// Set the parent of this display object.
      #[no_dynamic]
      fn set_parent(self, context: &mut UpdateContext<'gc>, parent: Option<DisplayObject<'gc>>) {
@@ -4310,7 +4326,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          let had_parent = self.parent().is_some();
          let write = Gc::write(context.gc(), self.base());
          DisplayObjectBase::set_parent_ignoring_orphan_list(write, parent);
-@@ -2091,6 +2650,8 @@ pub trait TDisplayObject<'gc>:
+@@ -2091,6 +2666,8 @@ pub trait TDisplayObject<'gc>:
  
      #[no_dynamic]
      fn set_scaling_grid(self, rect: Rectangle<Twips>) {
@@ -4319,7 +4335,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          self.base().scaling_grid.set(rect);
      }
  
-@@ -2284,7 +2845,9 @@ pub trait TDisplayObject<'gc>:
+@@ -2284,7 +2861,9 @@ pub trait TDisplayObject<'gc>:
      /// Sets whether this display object has a scroll rectangle applied.
      #[no_dynamic]
      fn set_has_scroll_rect(self, value: bool) {
@@ -4330,7 +4346,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
      }
  
      /// Whether this display object has been created by ActionScript 1/2.
-@@ -2501,10 +3064,18 @@ pub trait TDisplayObject<'gc>:
+@@ -2501,10 +3080,18 @@ pub trait TDisplayObject<'gc>:
      /// (as long as the child is still on a render list)
      #[no_dynamic]
      fn pre_render(self, _context: &mut RenderContext<'_, 'gc>) {
@@ -4351,7 +4367,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
      }
  
      fn render_self(self, _context: &mut RenderContext<'_, 'gc>) {}
-@@ -2841,6 +3412,9 @@ pub trait TDisplayObject<'gc>:
+@@ -2841,6 +3428,9 @@ pub trait TDisplayObject<'gc>:
      /// If this object or any ancestor is marked as cacheAsBitmap, it will invalidate that cache.
      #[no_dynamic]
      fn invalidate_cached_bitmap(self) {
@@ -4361,7 +4377,7 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
          if self.base().invalidate_cached_bitmap() {
              // Don't inform ancestors if we've already done so this frame
              if let Some(parent) = self.parent() {
-@@ -3296,3 +3870,599 @@ impl<'gc> DisplayObjectWeak<'gc> {
+@@ -3296,3 +3886,613 @@ impl<'gc> DisplayObjectWeak<'gc> {
          }
      }
  }
@@ -4834,11 +4850,14 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
 +/// the object is then drawn without its filters. AQW draws its 960x550 stage at the window's
 +/// size, so on a big window (4K: about 3.9 times) a room's backdrop with a color matrix filter
 +/// (in /sevencircleswar, 1.3 million stage pixels with its parts out of view) crosses it and
-+/// loses its colors, while the game's launcher draws it small and keeps them. Here such an
-+/// object's picture is drawn at the largest scale that fits (filters scaled with it) and
-+/// stretched back: a little softer than the rest of the screen, but with its filters.
-+/// Below `MIN_CACHE_SCALE`, or with `RUFFLE_FLASH_CACHE_LIMITS=1`, Flash's behaviour is kept.
-+/// Returns scale 1 and `matrix` itself when the picture fits.
++/// loses its colors, while a 1080p screen (and the game's launcher) draws it smaller and keeps
++/// them. Here such an object's picture is drawn at the largest scale that fits (filters scaled
++/// with it) and stretched back: a little softer than the rest of the screen, but with its
++/// filters. Only on a stage drawn bigger than `REFERENCE_VIEW_SCALE`, and only for an object
++/// whose picture fits the limits at that scale: one that is too big there too is drawn without
++/// its filters at every larger size as well, as before. Below `MIN_CACHE_SCALE`, or without
++/// `RUFFLE_CACHE_REDUCTION`, Flash's behaviour is kept.
++/// Returns scale 1 and `matrix` itself when the picture fits, or is left to Flash's behaviour.
 +fn cache_reduction<'gc>(
 +    this: DisplayObject<'gc>,
 +    matrix: &Matrix,
@@ -4903,6 +4922,17 @@ index 2425006896842d5dcd14a3e9e683481eddf6f8de..9d18a2d1cf6592a641f47ada04a03abf
 +        return (1.0, full_matrix, full_bounds);
 +    };
 +    if cache_size_acceptable(width, height, swf_version) || width == 0 || height == 0 {
++        return (1.0, full_matrix, full_bounds);
++    }
++    // Only what the reference size shows with its filters keeps them on a bigger screen (see
++    // `REFERENCE_VIEW_SCALE`). (`view_matrix` is the stage's, times the reduction of the cached
++    // pictures this one is drawn into.)
++    let view_scale = view_matrix.a.abs().max(view_matrix.d.abs());
++    if view_scale <= REFERENCE_VIEW_SCALE {
++        return (1.0, full_matrix, full_bounds);
++    }
++    let (_, reference_view, reference_bounds) = measure(REFERENCE_VIEW_SCALE / view_scale);
++    if !fits(texture_size(&reference_view, &reference_bounds, 0.0)) {
 +        return (1.0, full_matrix, full_bounds);
 +    }
 +    let (max_side, max_total) = if swf_version > 9 {
@@ -15923,7 +15953,7 @@ index cacd85384de3de95e416350798fb2abdb20bd8b8..6ed271f82d62f2b427523a948ea4d0fb
 +    }
 +}
 diff --git a/desktop/Cargo.toml b/desktop/Cargo.toml
-index e9a8c49aa8a8e6f5ae6eeec3c098146b798a1bca..6d1873deb758873d0529c3ec85d3d2ffb9ca51c7 100644
+index e9a8c49aa8a8e6f5ae6eeec3c098146b798a1bca..d1552359311c8d805dd89d96aa75caa6fb013bf0 100644
 --- a/desktop/Cargo.toml
 +++ b/desktop/Cargo.toml
 @@ -12,6 +12,12 @@ workspace = true
@@ -15975,8 +16005,8 @@ index e9a8c49aa8a8e6f5ae6eeec3c098146b798a1bca..6d1873deb758873d0529c3ec85d3d2ff
 +CompanyName = "Mugetsu"
 +LegalCopyright = "Mugetsu; based on Ruffle, Copyright © 2018 Ruffle LLC and Ruffle contributors"
 +# Keep equal to `mugetsu::VERSION` (desktop/src/mugetsu.rs).
-+ProductVersion = "2.0.2"
-+FileVersion = "2.0.2 (Ruffle 0.8.0-nightly.2026.11.10)"
++ProductVersion = "2.0.3"
++FileVersion = "2.0.3 (Ruffle 0.8.0-nightly.2026.11.10)"
  # InternalName should be the same as the module name
  InternalName = "ruffle_desktop"
 -OriginalFilename = "ruffle.exe"
@@ -23738,10 +23768,10 @@ index 0000000000000000000000000000000000000000..0fc53a49ba553dde62dfa256f8679daf
 +}
 diff --git a/desktop/src/mugetsu.rs b/desktop/src/mugetsu.rs
 new file mode 100644
-index 0000000000000000000000000000000000000000..a2413b3e5b9c5b6353687c20d9e150071f58d579
+index 0000000000000000000000000000000000000000..e2b78f008f77f7de4338ba972410a4520d049b25
 --- /dev/null
 +++ b/desktop/src/mugetsu.rs
-@@ -0,0 +1,1819 @@
+@@ -0,0 +1,1834 @@
 +//! AQW build (Mugetsu): things the release player does on its own, without a launcher:
 +//! the window title, remembering that the Vulkan driver crashed on this PC (so the next start
 +//! uses DirectX 12), the "running on the built-in graphics" tip and the new-version notice.
@@ -23754,7 +23784,7 @@ index 0000000000000000000000000000000000000000..a2413b3e5b9c5b6353687c20d9e15007
 +
 +/// Mugetsu's own version. Keep it equal to `ProductVersion` in desktop/Cargo.toml
 +/// ([package.metadata.winresource]) and to the GitHub release tag (`v1.1.1`).
-+pub const VERSION: &str = "2.0.2";
++pub const VERSION: &str = "2.0.3";
 +
 +const RELEASES_API: &str = "https://api.github.com/repos/mugetsu-aqw/mugetsu/releases/latest";
 +const RELEASES_PAGE: &str = "https://github.com/mugetsu-aqw/mugetsu/releases/latest";
@@ -24747,7 +24777,7 @@ index 0000000000000000000000000000000000000000..a2413b3e5b9c5b6353687c20d9e15007
 +/// unless their `no-...` file or `safe-drawing` is next to the exe. The code that reads each
 +/// variable still has it off unless it is set, so a movie on the command line and the tests
 +/// run without them unless they ask.
-+const DEFAULT_ON: [(&str, &str, &str); 9] = [
++const DEFAULT_ON: [(&str, &str, &str); 10] = [
 +    // The per-frame walks skip the branches with nothing to do: frame construction and frame
 +    // scripts, and `enter_frame`.
 +    ("lean-scripts", "RUFFLE_LEAN_SCRIPTS", "no-lean-scripts"),
@@ -24777,6 +24807,11 @@ index 0000000000000000000000000000000000000000..a2413b3e5b9c5b6353687c20d9e15007
 +    // reads it while the next frame is drawn into it. On only by default while
 +    // `CAPTURE_SAFE_BY_DEFAULT` is.
 +    ("capture-safe", CAPTURE_SAFE, "no-capture-safe"),
++    // Not a speed-up either: on a screen bigger than 1080p, a cached or filtered object too big
++    // for Flash's limits there, but not on a 1080p screen, is drawn smaller and stretched back
++    // instead of losing its filters (see core's `cache_reduction`): /sevencircleswar keeps its
++    // colours on a 4K screen. Up to 1080p nothing changes.
++    ("cache-reduction", "RUFFLE_CACHE_REDUCTION", "no-cache-reduction"),
 +];
 +
 +const CAPTURE_SAFE: &str = "RUFFLE_CAPTURE_SAFE";
@@ -25421,7 +25456,7 @@ index 0000000000000000000000000000000000000000..a2413b3e5b9c5b6353687c20d9e15007
 +        assert!(parse_version("v1.0.10") > parse_version("1.0.9"));
 +    }
 +
-+    const NEW: [&str; 9] = [
++    const NEW: [&str; 10] = [
 +        "RUFFLE_LEAN_SCRIPTS",
 +        "RUFFLE_LEAN_FRAMES",
 +        "RUFFLE_LEAN_RENDER",
@@ -25431,6 +25466,7 @@ index 0000000000000000000000000000000000000000..a2413b3e5b9c5b6353687c20d9e15007
 +        "RUFFLE_SHARP_SNAPSHOTS",
 +        "RUFFLE_EARLY_SCRIPTS",
 +        "RUFFLE_CAPTURE_SAFE",
++        "RUFFLE_CACHE_REDUCTION",
 +    ];
 +
 +    const THREAD: &str = super::RENDER_THREAD;
@@ -25475,6 +25511,15 @@ index 0000000000000000000000000000000000000000..a2413b3e5b9c5b6353687c20d9e15007
 +        assert!(variables(&["capture-safe"]).contains(&super::CAPTURE_SAFE));
 +        assert!(!variables(&["no-capture-safe"]).contains(&super::CAPTURE_SAFE));
 +        assert!(!variables(&["capture-safe", "no-capture-safe"]).contains(&super::CAPTURE_SAFE));
++    }
++
++    #[test]
++    fn cache_reduction_follows_its_files() {
++        const VAR: &str = "RUFFLE_CACHE_REDUCTION";
++        assert!(variables(&[]).contains(&VAR));
++        assert!(!variables(&["no-cache-reduction"]).contains(&VAR));
++        assert!(!variables(&["safe-drawing"]).contains(&VAR));
++        assert!(variables(&["safe-drawing", "cache-reduction"]).contains(&VAR));
 +    }
 +
 +    #[test]
